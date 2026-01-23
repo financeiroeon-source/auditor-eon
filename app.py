@@ -33,13 +33,12 @@ def get_pdf_text(uploaded_file):
             text += page.extract_text() + "\n"
     return text
 
-# --- FUNÇÃO 2: IA (CÉREBRO ATUALIZADO) ---
+# --- FUNÇÃO 2: IA (MODELO CLÁSSICO - GEMINI PRO) ---
 def analisar_conta_com_ia(texto_fatura, chave):
-    # Configura a chave
     genai.configure(api_key=chave)
     
-    # Modelo Atualizado (Gemini 1.5 Flash)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # MUDANÇA AQUI: Usando o modelo PRO que é compatível com todas as versões
+    model = genai.GenerativeModel('gemini-pro')
     
     prompt = f"""
     Aja como um software extrator de dados. Analise o texto desta fatura de energia.
@@ -68,7 +67,7 @@ def analisar_conta_com_ia(texto_fatura, chave):
         if match:
             return json.loads(match.group(0))
         else:
-            return {"erro": "IA não retornou JSON válido"}
+            return {"erro": "IA não retornou JSON válido. Tente novamente."}
             
     except Exception as e:
         return {"erro": str(e)}
@@ -125,13 +124,13 @@ if not api_key:
 uploaded_file = st.file_uploader("Arraste a fatura (PDF) aqui", type="pdf")
 
 if uploaded_file:
-    with st.spinner("🔍 A IA está auditando a conta..."):
+    with st.spinner("🔍 Auditando a conta..."):
         texto = get_pdf_text(uploaded_file)
         dados_ia = analisar_conta_com_ia(texto, api_key)
         
         if "erro" in dados_ia:
             st.error("Erro técnico: " + str(dados_ia['erro']))
-            st.info("Tente clicar em 'Reboot App' no menu do topo.")
+            st.info("Dica: Verifique se sua chave API está correta.")
         else:
             sem, com, econ, placas = calcular_viabilidade(dados_ia, ano_regra)
             
