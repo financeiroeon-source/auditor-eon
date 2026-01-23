@@ -7,27 +7,25 @@ import re
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Auditor IA - EON", page_icon="⚡", layout="wide")
 
-# Estilo Personalizado EON
+# Estilo EON
 st.markdown("""
     <style>
     .main {background-color: #050505; color: #ffffff;}
     .stButton>button {background-color: #EE7348; color: white; border-radius: 8px; border: none; font-weight: bold;}
     .stMetric {background-color: #1a1a1a; padding: 15px; border-radius: 10px; border: 1px solid #333;}
     h1, h2, h3 {color: #EE7348;}
-    .stAlert {background-color: #1a1a1a; color: white; border: 1px solid #333;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- BARRA LATERAL ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚡ EON SOLAR")
-    st.markdown("---")
     api_key = st.text_input("Cole sua Google API Key aqui:", type="password")
     st.info("💡 Crie sua chave em: aistudio.google.com")
     st.divider()
     ano_regra = st.selectbox("Ano de Referência (Fio B)", [2025, 2026, 2027, 2028], index=1)
 
-# --- FUNÇÃO 1: LER O PDF ---
+# --- FUNÇÃO 1: LER PDF ---
 def get_pdf_text(uploaded_file):
     text = ""
     with pdfplumber.open(uploaded_file) as pdf:
@@ -35,9 +33,13 @@ def get_pdf_text(uploaded_file):
             text += page.extract_text() + "\n"
     return text
 
-# --- FUNÇÃO 2: ANALISAR COM IA (COM SISTEMA ANTI-FALHA) ---
+# --- FUNÇÃO 2: IA (CÉREBRO ATUALIZADO) ---
 def analisar_conta_com_ia(texto_fatura, chave):
+    # Configura a chave
     genai.configure(api_key=chave)
+    
+    # Modelo Atualizado (Gemini 1.5 Flash)
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     prompt = f"""
     Aja como um software extrator de dados. Analise o texto desta fatura de energia.
@@ -58,30 +60,20 @@ def analisar_conta_com_ia(texto_fatura, chave):
     """
     
     try:
-        # Tenta o modelo FLASH (Mais rápido/novo)
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content(prompt)
-        except:
-            # Se der erro (404), usa o modelo PRO (Mais estável/antigo)
-            st.toast("Alternando para modelo de backup...", icon="🔄")
-            model = genai.GenerativeModel('gemini-pro')
-            response = model.generate_content(prompt)
-
+        response = model.generate_content(prompt)
         texto_resposta = response.text
         
-        # VACINA: Busca apenas o que está entre chaves { }
+        # Filtra apenas o JSON
         match = re.search(r'\{.*\}', texto_resposta, re.DOTALL)
         if match:
-            json_str = match.group(0)
-            return json.loads(json_str)
+            return json.loads(match.group(0))
         else:
             return {"erro": "IA não retornou JSON válido"}
             
     except Exception as e:
         return {"erro": str(e)}
 
-# --- FUNÇÃO 3: CÁLCULOS EON ---
+# --- FUNÇÃO 3: CÁLCULOS ---
 def calcular_viabilidade(dados, ano_input):
     consumo = dados.get('consumo_kwh', 0)
     empresa = dados.get('concessionaria', 'Outra').lower()
@@ -123,9 +115,8 @@ def calcular_viabilidade(dados, ano_input):
     
     return conta_sem_solar, conta_com_solar, economia, placas
 
-# --- TELA PRINCIPAL ---
+# --- TELA ---
 st.title("🤖 EON AI Auditor")
-st.markdown("### Inteligência Artificial para Análise de Contas")
 
 if not api_key:
     st.warning("👈 Insira a Chave da IA no menu lateral para começar.")
@@ -134,18 +125,17 @@ if not api_key:
 uploaded_file = st.file_uploader("Arraste a fatura (PDF) aqui", type="pdf")
 
 if uploaded_file:
-    with st.spinner("🔍 A IA está lendo a fatura..."):
+    with st.spinner("🔍 A IA está auditando a conta..."):
         texto = get_pdf_text(uploaded_file)
         dados_ia = analisar_conta_com_ia(texto, api_key)
         
         if "erro" in dados_ia:
             st.error("Erro técnico: " + str(dados_ia['erro']))
-            st.info("Dica: Tente recarregar a página.")
+            st.info("Tente clicar em 'Reboot App' no menu do topo.")
         else:
             sem, com, econ, placas = calcular_viabilidade(dados_ia, ano_regra)
             
             st.success("✅ Análise Concluída!")
-            
             st.subheader("📋 Raio-X da Fatura")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Concessionária", dados_ia.get('concessionaria', 'ND'))
@@ -153,25 +143,13 @@ if uploaded_file:
             c3.metric("Valor Atual", f"R$ {dados_ia.get('valor_total_fatura'):.2f}")
             c4.metric("CIP", f"R$ {dados_ia.get('cip'):.2f}")
             
-            alertas = []
-            if dados_ia.get('multas', 0) > 0: alertas.append(f"⚠️ Multas: R$ {dados_ia['multas']:.2f}")
-            if dados_ia.get('reativa', 0) > 0: alertas.append(f"⚠️ Reativa: R$ {dados_ia['reativa']:.2f}")
-            if dados_ia.get('tem_solar'): alertas.append("☀️ Cliente JÁ POSSUI solar")
-            
-            if alertas:
-                for a in alertas: st.error(a)
-            else:
-                st.info("✅ Fatura saudável.")
-
             st.markdown("---")
-            st.subheader("☀️ Solução Recomendada EON")
+            st.subheader("☀️ Solução Recomendada")
             k1, k2, k3 = st.columns(3)
-            k1.metric("Kit Sugerido", f"{placas} Placas", "550W")
-            k2.metric("Nova Conta Estimada", f"R$ {com:.2f}", f"-{round((econ/sem)*100) if sem > 0 else 0}%")
+            k1.metric("Kit", f"{placas} Placas", "550W")
+            k2.metric("Nova Conta", f"R$ {com:.2f}", f"-{round((econ/sem)*100) if sem > 0 else 0}%")
             k3.metric("Economia Anual", f"R$ {econ * 12:,.2f}", "Livre")
             
-            texto_zap = f"Olá! Analisei sua conta. Consumo {dados_ia.get('consumo_kwh')}kWh. Com a EON, economia anual de R$ {econ*12:,.2f}."
-            st.link_button("📲 Enviar Proposta no WhatsApp", f"https://wa.me/?text={texto_zap}")
-
-            with st.expander("Ver Dados Brutos"):
-                st.json(dados_ia)
+            st.link_button("📲 WhatsApp", f"https://wa.me/?text=Proposta EON: Economia de R$ {econ*12:.2f}/ano")
+            
+            with st.expander("Ver JSON"): st.json(dados_ia)
