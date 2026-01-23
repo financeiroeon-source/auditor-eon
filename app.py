@@ -1,171 +1,125 @@
 import streamlit as st
-import pdfplumber
-import google.generativeai as genai
-import json
-import re
 import pandas as pd
-import plotly.express as px
+from analise_gd import AuditorEonEngine # Importa o arquivo que criamos no Passo 1
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="EON Auditor Pro", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Auditor-Eon", layout="wide")
 
-# Estilo EON (Dark Mode)
-st.markdown("""
-    <style>
-    .main {background-color: #050505; color: #ffffff;}
-    .stButton>button {background-color: #EE7348; color: white; border-radius: 8px; border: none; font-weight: bold;}
-    .stMetric {background-color: #1a1a1a; padding: 15px; border-radius: 10px; border: 1px solid #333;}
-    h1, h2, h3 {color: #EE7348;}
-    .stAlert {background-color: #1a1a1a; color: white; border: 1px solid #333;}
-    </style>
-    """, unsafe_allow_html=True)
+st.title("⚡ Auditor-Eon: Análise de Faturas GD")
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚡ EON SOLAR")
-    api_key = st.text_input("Cole sua Google API Key:", type="password")
-    st.caption("Modelo: Gemini 2.5 Flash")
-    st.divider()
-    ano_regra = st.selectbox("Ano de Referência (GD II)", [2025, 2026, 2027, 2028], index=1)
+# 1. UPLOAD DO ARQUIVO
+uploaded_file = st.file_uploader("Faça o upload da Fatura (PDF ou Imagem)", type=["pdf", "png", "jpg"])
 
-# --- LEITURA DE PDF ---
-def get_pdf_text(uploaded_file):
-    text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() + "\n"
-    return text
+# Variável para guardar os dados do OCR na sessão (para não perder quando atualizar a tela)
+if 'dados_ocr' not in st.session_state:
+    st.session_state['dados_ocr'] = None
 
-# --- IA COM ANÁLISE PROFUNDA ---
-def analisar_conta_detalhada(texto_fatura, chave):
-    genai.configure(api_key=chave)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
-    prompt = f"""
-    Aja como um Perito em Faturas de Energia. Analise o texto e extraia os componentes de custo detalhados.
-    
-    Retorne um JSON com:
-    1. "concessionaria": "Light" ou "Enel".
-    2. "consumo_kwh": (Int) Consumo total medido.
-    3. "valor_total": (Float) Valor final da conta R$.
-    4. "tusd": (Float) Valor monetário (R$) total referente à TUSD (Uso do Sistema) ou Distribuição.
-    5. "te": (Float) Valor monetário (R$) total referente à TE (Energia).
-    6. "bandeiras": (Float) Valor de bandeiras tarifárias (Amarela/Vermelha/Escassez).
-    7. "cip": (Float) Contribuição Ilum. Pública.
-    8. "impostos_federais": (Float) Valor PIS + COFINS (geralmente detalhado no rodapé).
-    9. "icms_total": (Float) Valor total do ICMS.
-    10. "multas": (Float) Multas/Juros.
-    11. "mes_ref": (String) Mês/Ano.
-
-    Se não achar um valor específico explícito, coloque 0.
-    
-    TEXTO:
-    {texto_fatura}
-    """
-    
-    try:
-        response = model.generate_content(prompt)
-        match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        return {"erro": "Falha no JSON da IA"}
-    except Exception as e:
-        return {"erro": str(e)}
-
-# --- TELA PRINCIPAL ---
-st.title("🔎 EON Auditor Pro")
-st.markdown("### Decomposição de Custos e Análise Técnica")
-
-if not api_key:
-    st.warning("👈 Insira a API Key para começar.")
-    st.stop()
-
-uploaded_file = st.file_uploader("Arraste a fatura (PDF)", type="pdf")
-
-if uploaded_file:
-    with st.spinner("🔬 Realizando autópsia da conta..."):
-        texto = get_pdf_text(uploaded_file)
-        dados = analisar_conta_detalhada(texto, api_key)
+# 2. PROCESSAMENTO DO OCR (Seu código atual entra aqui)
+if uploaded_file is not None and st.session_state['dados_ocr'] is None:
+    with st.spinner("Lendo a conta..."):
+        # ==============================================================================
+        # [AQUI VAI A SUA FUNÇÃO DE OCR QUE JÁ EXISTIA]
+        # Exemplo simulado (substitua pela sua chamada real):
+        # dados_lidos = sua_funcao_ocr(uploaded_file)
+        # ==============================================================================
         
-        if "erro" in dados:
-            st.error(dados['erro'])
+        # --- APENAS PARA EXEMPLO (Substitua isso pelo retorno do seu OCR) ---
+        dados_lidos = {
+            'nome': 'João Silva',
+            'cidade': 'Campinas',
+            'distribuidora': 'CPFL',
+            'mes_referencia': 'Jan/2024',
+            'consumo_kwh': 450.0,      # Consumo Rede
+            'injetada_kwh': 380.0,     # Energia Injetada
+            'valor_total': 150.50,     # Valor da conta R$
+            'saldo_anterior': 100.0,
+            'custos_extras': 15.00     # Multas/CIP
+        }
+        # --------------------------------------------------------------------
+        
+        # Salva no estado da sessão
+        st.session_state['dados_ocr'] = dados_lidos
+        st.success("Fatura processada! Agora, informe a geração do inversor.")
+
+# 3. INTERFACE DE INPUT E RESULTADOS
+if st.session_state['dados_ocr']:
+    dados = st.session_state['dados_ocr']
+    
+    st.divider()
+    st.subheader("🛠️ Passo 2: Calibragem do Sistema")
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown(f"""
+        **Dados lidos da conta:**
+        - Consumo Rede: `{dados.get('consumo_kwh')} kWh`
+        - Injetada na Rede: `{dados.get('injetada_kwh')} kWh`
+        """)
+    
+    with col2:
+        # AQUI É O ONDE O USUÁRIO ENTRA COM O DADO QUE FALTAVA
+        geracao_user = st.number_input(
+            "Qual foi a Geração Total (kWh) no inversor?", 
+            min_value=0.0,
+            value=float(dados.get('injetada_kwh', 0)), # Sugestão inicial
+            help="Olhe no aplicativo do inversor (SolarEdge, Fronius, Growatt, etc)."
+        )
+
+    # Botão para gerar o relatório final
+    if st.button("Gerar Auditoria Completa 🚀", type="primary"):
+        
+        # --- CHAMA O CÉREBRO (O ARQUIVO ANALISE_GD.PY) ---
+        engine = AuditorEonEngine(dados, geracao_user)
+        res = engine.processar_analise()
+        
+        # --- EXIBE OS 15 PONTOS DO DASHBOARD ---
+        st.markdown("---")
+        st.header(f"Relatório de Análise: {res['cliente']}")
+        
+        # Linha 1: Dados Cadastrais
+        c1, c2, c3 = st.columns(3)
+        c1.write(f"**Cidade:** {res['cidade']}")
+        c2.write(f"**Concessionária:** {res['concessionaria']}")
+        c3.write(f"**Período:** {res['periodo']}")
+        
+        st.divider()
+
+        # Linha 2: O Selo de Verificação (Item 14)
+        if res['selo']['status'] == "VERDE":
+            st.success(f"✅ {res['selo']['msg']}")
         else:
-            # --- CÁLCULOS TÉCNICOS ---
-            total = dados.get('valor_total', 0)
-            consumo = dados.get('consumo_kwh', 1) # evita div por 0
-            
-            # Estimativa de Fio B (Regra Prática RJ: ~45% da TUSD ou ~28% da Tarifa Cheia)
-            # Como a conta nem sempre separa TUSD Fio A e B, usamos a regra da ANEEL sobre a TUSD
-            tusd_total = dados.get('tusd', 0)
-            if tusd_total == 0: 
-                # Se a IA não achou a TUSD separada, estima 45% da conta (menos CIP)
-                tusd_total = (total - dados.get('cip',0)) * 0.45
-            
-            fio_b_estimado = tusd_total * 0.55 # Aprox 55% da TUSD é Fio B (Remuneração da Distribuidora)
-            
-            # Custo do kWh Real (Tarifa Média Efetiva)
-            tarifa_media = total / consumo if consumo > 0 else 0
+            st.warning(f"⚠️ {res['selo']['msg']}")
 
-            # --- VISUALIZAÇÃO ---
-            
-            # 1. CABEÇALHO
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Valor da Conta", f"R$ {total:.2f}")
-            c2.metric("Consumo", f"{consumo} kWh")
-            c3.metric("Tarifa Real (R$/kWh)", f"R$ {tarifa_media:.2f}")
-            
-            st.divider()
+        # Linha 3: Big Numbers (Economia e Consumo Instantâneo)
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Economia Real", f"R$ {res['economia_reais']:.2f}", f"{res['economia_perc']:.1f}%")
+        k2.metric("Conta Sem Solar", f"R$ {res['conta_sem_solar']:.2f}")
+        k3.metric("Consumo Instantâneo", f"{res['consumo_instantaneo']:.0f} kWh", help="Energia consumida direto do sol")
 
-            # 2. DETALHAMENTO DO CUSTO (GRÁFICO)
-            st.subheader("🍰 Para onde vai o dinheiro do cliente?")
+        # Linha 4: Tabelas Detalhadas
+        col_esq, col_dir = st.columns(2)
+        
+        with col_esq:
+            st.caption("Balanço Energético (kWh)")
+            df_energia = pd.DataFrame({
+                "Descrição": ["Consumo da Rede (Item 5)", "Geração Sistema (Item 6)", "Consumo Instantâneo (Item 7)", "Novo Saldo Créditos (Item 11)"],
+                "Valor": [res['consumo_rede'], res['geracao_sistema'], res['consumo_instantaneo'], res['saldo_creditos']]
+            })
+            st.dataframe(df_energia, hide_index=True, use_container_width=True)
             
-            # Prepara dados para o gráfico
-            custos = {
-                "Energia (Geração/TE)": dados.get('te', 0),
-                "Fio/Distribuição (TUSD)": tusd_total,
-                "Impostos (ICMS/PIS/COFINS)": dados.get('icms_total', 0) + dados.get('impostos_federais', 0),
-                "Iluminação Pública (CIP)": dados.get('cip', 0),
-                "Bandeiras/Multas": dados.get('bandeiras', 0) + dados.get('multas', 0)
-            }
-            
-            # Se a soma não bater com o total (comum em leitura de OCR), cria um "Outros/Ajustes"
-            soma_parcial = sum(custos.values())
-            if soma_parcial < total:
-                custos["Outros/Não Detalhado"] = total - soma_parcial
-            
-            df_chart = pd.DataFrame(list(custos.items()), columns=['Componente', 'Valor'])
-            
-            col_graph, col_detalhes = st.columns([1.5, 1])
-            
-            with col_graph:
-                fig = px.pie(df_chart, values='Valor', names='Componente', hole=0.4, 
-                             color_discrete_sequence=['#EE7348', '#FF9F1C', '#9D4EDD', '#00DC5D', '#E74C3C', '#95A5A6'])
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font={'color': "white"})
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col_detalhes:
-                st.markdown("#### Detalhes em R$")
-                for k, v in custos.items():
-                    if v > 0:
-                        st.write(f"**{k}:** R$ {v:.2f}")
-                
-                st.info(f"💡 **Fio B Estimado:** R$ {fio_b_estimado:.2f} (Este é o valor que continuará sendo cobrado parcialmente na Lei 14.300)")
+        with col_dir:
+            st.caption("Custos e Taxas (R$)")
+            df_custos = pd.DataFrame({
+                "Descrição": ["Total Fatura Atual", "Estimativa Fio B/ICMS (Item 12)", "Outros Custos (Item 13)"],
+                "Valor": [dados['valor_total'], res['custos_fio_b'], res['outros_custos']]
+            })
+            st.dataframe(df_custos, hide_index=True, use_container_width=True)
 
-            st.divider()
-
-            # 3. ANÁLISE GD II (SIMULAÇÃO RÁPIDA)
-            st.subheader("☀️ Impacto GD II (Lei 14.300)")
-            
-            mapa_pgto = {2025: 0.45, 2026: 0.60, 2027: 0.75, 2028: 0.90}
-            perc_pagar = mapa_pgto[ano_regra]
-            
-            fio_b_a_pagar = fio_b_estimado * perc_pagar
-            economia_potencial = total - fio_b_a_pagar - dados.get('cip', 0)
-            
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Fio B a Pagar", f"R$ {fio_b_a_pagar:.2f}", f"{perc_pagar*100}% da Regra")
-            k2.metric("Nova Conta Estimada", f"R$ {fio_b_a_pagar + dados.get('cip', 0):.2f}", "Fio B + CIP")
-            k3.metric("Economia Máxima", f"R$ {economia_potencial:.2f}", "Potencial")
-            
-            with st.expander("Ver JSON Bruto da IA"):
-                st.json(dados)
+        # Linha 5: Resumo Executivo (Item 15)
+        st.info(f"📝 **Resumo do Auditor:** {res['selo']['msg']} \n\n {res.get('resumo', 'Resumo gerado automaticamente.')}")
+        
+    # Botão de Reset (para analisar outra conta)
+    if st.button("Nova Análise"):
+        st.session_state['dados_ocr'] = None
+        st.experimental_rerun()
