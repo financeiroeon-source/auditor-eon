@@ -1,5 +1,5 @@
 streamlit
 pandas
 pymupdf
-google-generativeai
 plotly
+google-generativeai>=0.8.3
