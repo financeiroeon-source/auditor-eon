@@ -3,9 +3,11 @@ import pdfplumber
 import google.generativeai as genai
 import json
 import re
+import pandas as pd
+import plotly.express as px
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Auditor IA - EON", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="EON Auditor Pro", page_icon="⚡", layout="wide")
 
 # Estilo EON (Dark Mode)
 st.markdown("""
@@ -18,20 +20,15 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- SIDEBAR (CONFIGURAÇÕES) ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚡ EON SOLAR")
-    st.markdown("---")
-    
-    # Campo de Senha (API Key)
-    api_key = st.text_input("Cole sua Google API Key aqui:", type="password")
-    st.caption("Modelo Ativo: Gemini 2.5 Flash 🚀")
-    
+    api_key = st.text_input("Cole sua Google API Key:", type="password")
+    st.caption("Modelo: Gemini 2.5 Flash")
     st.divider()
-    ano_regra = st.selectbox("Ano de Referência (Fio B)", [2025, 2026, 2027, 2028], index=1)
-    st.info("ℹ️ Define o % de Fio B na simulação.")
+    ano_regra = st.selectbox("Ano de Referência (GD II)", [2025, 2026, 2027, 2028], index=1)
 
-# --- FUNÇÃO 1: LER O PDF ---
+# --- LEITURA DE PDF ---
 def get_pdf_text(uploaded_file):
     text = ""
     with pdfplumber.open(uploaded_file) as pdf:
@@ -39,145 +36,136 @@ def get_pdf_text(uploaded_file):
             text += page.extract_text() + "\n"
     return text
 
-# --- FUNÇÃO 2: CÉREBRO DA IA (ATUALIZADO) ---
-def analisar_conta_com_ia(texto_fatura, chave):
+# --- IA COM ANÁLISE PROFUNDA ---
+def analisar_conta_detalhada(texto_fatura, chave):
     genai.configure(api_key=chave)
-    
-    # AQUI ESTAVA O ERRO: Atualizado para o modelo que seu diagnóstico confirmou
     model = genai.GenerativeModel('gemini-2.5-flash')
     
     prompt = f"""
-    Aja como um Engenheiro de Vendas da EON Energia Solar.
-    Analise o texto desta fatura de energia elétrica e extraia os dados técnicos.
+    Aja como um Perito em Faturas de Energia. Analise o texto e extraia os componentes de custo detalhados.
     
-    Retorne APENAS um JSON (sem texto adicional) com as chaves:
-    1. "concessionaria": "Light" ou "Enel" (se não achar, deduza pelo contexto).
-    2. "consumo_kwh": (Int) Consumo total faturado no mês.
-    3. "valor_total_fatura": (Float) Valor total a pagar R$.
-    4. "cip": (Float) Contribuição de Iluminação Pública.
-    5. "multas": (Float) Soma de multas, juros e mora.
-    6. "reativa": (Float) Valor de energia reativa excedente.
-    7. "tem_solar": (Boolean) True se tiver termos como "Energia Injetada", "GD", "Saldo".
-    8. "mes_referencia": (String) Mês/Ano da conta.
+    Retorne um JSON com:
+    1. "concessionaria": "Light" ou "Enel".
+    2. "consumo_kwh": (Int) Consumo total medido.
+    3. "valor_total": (Float) Valor final da conta R$.
+    4. "tusd": (Float) Valor monetário (R$) total referente à TUSD (Uso do Sistema) ou Distribuição.
+    5. "te": (Float) Valor monetário (R$) total referente à TE (Energia).
+    6. "bandeiras": (Float) Valor de bandeiras tarifárias (Amarela/Vermelha/Escassez).
+    7. "cip": (Float) Contribuição Ilum. Pública.
+    8. "impostos_federais": (Float) Valor PIS + COFINS (geralmente detalhado no rodapé).
+    9. "icms_total": (Float) Valor total do ICMS.
+    10. "multas": (Float) Multas/Juros.
+    11. "mes_ref": (String) Mês/Ano.
 
-    TEXTO DA FATURA:
+    Se não achar um valor específico explícito, coloque 0.
+    
+    TEXTO:
     {texto_fatura}
     """
     
     try:
         response = model.generate_content(prompt)
-        texto_resposta = response.text
-        
-        # Filtro de Segurança para pegar só o JSON
-        match = re.search(r'\{.*\}', texto_resposta, re.DOTALL)
+        match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-        else:
-            return {"erro": "A IA respondeu, mas não em JSON válido."}
-            
+        return {"erro": "Falha no JSON da IA"}
     except Exception as e:
         return {"erro": str(e)}
 
-# --- FUNÇÃO 3: CALCULADORA FINANCEIRA ---
-def calcular_viabilidade(dados, ano_input):
-    consumo = dados.get('consumo_kwh', 0)
-    empresa = dados.get('concessionaria', 'Outra').lower()
-    cip_real = dados.get('cip', 0)
-    
-    if consumo == 0: return 0, 0, 0, 0
-    
-    # Tarifas e Regras RJ
-    if 'light' in empresa:
-        tarifa = {'cheia': 1.22, 'fioB': 0.571} if consumo > 300 else {'cheia': 1.08, 'fioB': 0.520}
-        usa_icms_subvencao = True
-    else: 
-        tarifa = {'cheia': 1.15, 'fioB': 0.672} if consumo > 300 else {'cheia': 1.07, 'fioB': 0.600}
-        usa_icms_subvencao = False
-
-    mapa_fio = {2025: 0.45, 2026: 0.60, 2027: 0.75, 2028: 0.90}
-    perc_fio = mapa_fio.get(ano_input, 0.60)
-
-    # Cálculos
-    conta_sem_solar = dados.get('valor_total_fatura', 0)
-    if conta_sem_solar == 0: conta_sem_solar = (consumo * tarifa['cheia']) + cip_real
-
-    energia_injetada = consumo * 0.70 # 70% injetada
-    custo_fio_b = energia_injetada * (tarifa['fioB'] * perc_fio)
-    custo_minimo = 100 * tarifa['cheia'] # Trifásico Padrão
-    
-    custo_energia = max(custo_fio_b, custo_minimo)
-    
-    icms_extra = 0
-    if usa_icms_subvencao:
-        icms_extra = (energia_injetada * tarifa['cheia']) * 0.18
-        
-    conta_com_solar = custo_energia + cip_real + icms_extra
-    economia = conta_sem_solar - conta_com_solar
-    
-    # Dimensionamento (Kit)
-    potencia = consumo / 115
-    placas = round((potencia * 1000) / 550)
-    if placas < 4: placas = 4
-    
-    return conta_sem_solar, conta_com_solar, economia, placas
-
 # --- TELA PRINCIPAL ---
-st.title("🤖 EON AI Auditor")
-st.caption("Sistema Inteligente de Análise de Faturas")
+st.title("🔎 EON Auditor Pro")
+st.markdown("### Decomposição de Custos e Análise Técnica")
 
 if not api_key:
-    st.warning("👈 Insira sua Chave API no menu lateral para iniciar.")
+    st.warning("👈 Insira a API Key para começar.")
     st.stop()
 
-uploaded_file = st.file_uploader("Arraste a conta de luz (PDF) aqui", type="pdf")
+uploaded_file = st.file_uploader("Arraste a fatura (PDF)", type="pdf")
 
 if uploaded_file:
-    with st.spinner("🔍 Lendo fatura com Gemini 2.5..."):
-        # 1. Leitura
+    with st.spinner("🔬 Realizando autópsia da conta..."):
         texto = get_pdf_text(uploaded_file)
+        dados = analisar_conta_detalhada(texto, api_key)
         
-        # 2. IA
-        dados_ia = analisar_conta_com_ia(texto, api_key)
-        
-        if "erro" in dados_ia:
-            st.error(f"Erro na análise: {dados_ia['erro']}")
+        if "erro" in dados:
+            st.error(dados['erro'])
         else:
-            # 3. Cálculo
-            sem, com, econ, placas = calcular_viabilidade(dados_ia, ano_regra)
+            # --- CÁLCULOS TÉCNICOS ---
+            total = dados.get('valor_total', 0)
+            consumo = dados.get('consumo_kwh', 1) # evita div por 0
             
-            # --- DASHBOARD ---
-            st.success("✅ Análise Realizada com Sucesso!")
+            # Estimativa de Fio B (Regra Prática RJ: ~45% da TUSD ou ~28% da Tarifa Cheia)
+            # Como a conta nem sempre separa TUSD Fio A e B, usamos a regra da ANEEL sobre a TUSD
+            tusd_total = dados.get('tusd', 0)
+            if tusd_total == 0: 
+                # Se a IA não achou a TUSD separada, estima 45% da conta (menos CIP)
+                tusd_total = (total - dados.get('cip',0)) * 0.45
             
-            # BLOCO 1: DADOS
-            st.subheader("📋 Dados da Conta")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Concessionária", dados_ia.get('concessionaria', 'ND'))
-            c2.metric("Consumo", f"{dados_ia.get('consumo_kwh')} kWh")
-            c3.metric("Valor Fatura", f"R$ {dados_ia.get('valor_total_fatura'):.2f}")
-            c4.metric("CIP", f"R$ {dados_ia.get('cip'):.2f}")
+            fio_b_estimado = tusd_total * 0.55 # Aprox 55% da TUSD é Fio B (Remuneração da Distribuidora)
             
-            # Alertas
-            alertas = []
-            if dados_ia.get('multas', 0) > 0: alertas.append(f"⚠️ Multas detectadas: R$ {dados_ia['multas']:.2f}")
-            if dados_ia.get('reativa', 0) > 0: alertas.append(f"⚠️ Energia Reativa: R$ {dados_ia['reativa']:.2f}")
-            if dados_ia.get('tem_solar'): alertas.append("☀️ Cliente JÁ POSSUI sistema solar.")
-            
-            if alertas:
-                for a in alertas: st.error(a)
-            else:
-                st.info("✅ Fatura saudável (Sem multas ou desperdício reativo).")
+            # Custo do kWh Real (Tarifa Média Efetiva)
+            tarifa_media = total / consumo if consumo > 0 else 0
 
-            st.markdown("---")
+            # --- VISUALIZAÇÃO ---
             
-            # BLOCO 2: PROPOSTA
-            st.subheader("☀️ Proposta Comercial")
+            # 1. CABEÇALHO
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Valor da Conta", f"R$ {total:.2f}")
+            c2.metric("Consumo", f"{consumo} kWh")
+            c3.metric("Tarifa Real (R$/kWh)", f"R$ {tarifa_media:.2f}")
+            
+            st.divider()
+
+            # 2. DETALHAMENTO DO CUSTO (GRÁFICO)
+            st.subheader("🍰 Para onde vai o dinheiro do cliente?")
+            
+            # Prepara dados para o gráfico
+            custos = {
+                "Energia (Geração/TE)": dados.get('te', 0),
+                "Fio/Distribuição (TUSD)": tusd_total,
+                "Impostos (ICMS/PIS/COFINS)": dados.get('icms_total', 0) + dados.get('impostos_federais', 0),
+                "Iluminação Pública (CIP)": dados.get('cip', 0),
+                "Bandeiras/Multas": dados.get('bandeiras', 0) + dados.get('multas', 0)
+            }
+            
+            # Se a soma não bater com o total (comum em leitura de OCR), cria um "Outros/Ajustes"
+            soma_parcial = sum(custos.values())
+            if soma_parcial < total:
+                custos["Outros/Não Detalhado"] = total - soma_parcial
+            
+            df_chart = pd.DataFrame(list(custos.items()), columns=['Componente', 'Valor'])
+            
+            col_graph, col_detalhes = st.columns([1.5, 1])
+            
+            with col_graph:
+                fig = px.pie(df_chart, values='Valor', names='Componente', hole=0.4, 
+                             color_discrete_sequence=['#EE7348', '#FF9F1C', '#9D4EDD', '#00DC5D', '#E74C3C', '#95A5A6'])
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font={'color': "white"})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col_detalhes:
+                st.markdown("#### Detalhes em R$")
+                for k, v in custos.items():
+                    if v > 0:
+                        st.write(f"**{k}:** R$ {v:.2f}")
+                
+                st.info(f"💡 **Fio B Estimado:** R$ {fio_b_estimado:.2f} (Este é o valor que continuará sendo cobrado parcialmente na Lei 14.300)")
+
+            st.divider()
+
+            # 3. ANÁLISE GD II (SIMULAÇÃO RÁPIDA)
+            st.subheader("☀️ Impacto GD II (Lei 14.300)")
+            
+            mapa_pgto = {2025: 0.45, 2026: 0.60, 2027: 0.75, 2028: 0.90}
+            perc_pagar = mapa_pgto[ano_regra]
+            
+            fio_b_a_pagar = fio_b_estimado * perc_pagar
+            economia_potencial = total - fio_b_a_pagar - dados.get('cip', 0)
+            
             k1, k2, k3 = st.columns(3)
-            k1.metric("Kit Sugerido", f"{placas} Placas", "550W")
-            k2.metric("Nova Conta", f"R$ {com:.2f}", f"-{round((econ/sem)*100) if sem > 0 else 0}%")
-            k3.metric("Economia Anual", f"R$ {econ * 12:,.2f}", "Livre")
+            k1.metric("Fio B a Pagar", f"R$ {fio_b_a_pagar:.2f}", f"{perc_pagar*100}% da Regra")
+            k2.metric("Nova Conta Estimada", f"R$ {fio_b_a_pagar + dados.get('cip', 0):.2f}", "Fio B + CIP")
+            k3.metric("Economia Máxima", f"R$ {economia_potencial:.2f}", "Potencial")
             
-            texto_zap = f"Olá! Analisei sua conta de {dados_ia.get('mes_referencia')}. Consumo de {dados_ia.get('consumo_kwh')}kWh. Com a EON, você economiza R$ {econ*12:,.2f} por ano!"
-            st.link_button("📲 Gerar WhatsApp", f"https://wa.me/?text={texto_zap}")
-            
-            with st.expander("Ver Dados Brutos (JSON)"):
-                st.json(dados_ia)
+            with st.expander("Ver JSON Bruto da IA"):
+                st.json(dados)
