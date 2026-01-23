@@ -18,32 +18,63 @@ st.markdown("""
 
 # --- BARRA LATERAL ---
 with st.sidebar:
-    st.header("🤖 Cérebro da IA")
+    st.header("🤖 Configuração da IA")
     api_key = st.text_input("Cole sua Google API Key:", type="password")
     st.markdown("[Gerar Chave Gratuita](https://aistudio.google.com/app/apikey)")
     st.divider()
-    st.caption("Usando modelo: **Gemini 1.5 Flash**")
+    st.info("O sistema buscará automaticamente o melhor modelo disponível na sua conta.")
 
-# --- FUNÇÃO DE INTELIGÊNCIA ARTIFICIAL ---
+# --- FUNÇÃO INTELIGENTE DE SELEÇÃO DE MODELO ---
+def obter_modelo_disponivel():
+    """
+    Lista os modelos disponíveis na conta do usuário e escolhe o melhor,
+    evitando erros de 'Model Not Found'.
+    """
+    try:
+        modelos = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                modelos.append(m.name)
+        
+        # Tenta priorizar o Flash (mais rápido), depois o Pro, depois qualquer um que funcione
+        if not modelos:
+            return "gemini-pro" # Fallback padrão
+            
+        # Procura por ordem de preferência
+        for m in modelos:
+            if 'flash' in m and '1.5' in m: return m
+        for m in modelos:
+            if 'pro' in m and '1.5' in m: return m
+        for m in modelos:
+            if 'pro' in m and '1.0' in m: return m
+            
+        return modelos[0] # Retorna o primeiro que achar se nenhum favorito estiver lá
+    except:
+        return "gemini-pro" # Se der erro ao listar, tenta o clássico
+
+# --- CÉREBRO DA IA ---
 def analisar_com_ia(texto_fatura, chave_api):
     try:
-        # Configura a IA
         genai.configure(api_key=chave_api)
         
-        # Usa o modelo mais moderno e leve (Flash)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # --- AQUI ESTÁ A CORREÇÃO DO ERRO 404 ---
+        # Descobre qual modelo existe de verdade na sua conta
+        nome_modelo = obter_modelo_disponivel()
+        model = genai.GenerativeModel(nome_modelo)
+        # ----------------------------------------
         
         prompt = f"""
         Você é um auditor de faturas de energia elétrica.
         Analise o texto extraído do PDF abaixo e retorne um JSON.
         
-        Se encontrar números como "11013876", IGNORE, pois é leitura de medidor.
-        Busque valores de consumo real (geralmente entre 100 e 5000 kWh).
+        IMPORTANTE:
+        - Se encontrar números gigantes (ex: 11013876), IGNORE (é leitura de medidor).
+        - Busque o consumo mensal (geralmente entre 50 e 5000 kWh).
         
-        Campos Obrigatórios no JSON:
-        - "consumo_kwh": (float) O consumo ativo faturado.
-        - "injetada_kwh": (float) Energia injetada/compensada da GD. Se não tiver, use 0.0.
-        - "valor_total": (float) Valor final da conta (R$).
+        Campos Obrigatórios (JSON):
+        - "consumo_kwh": (float) Consumo faturado.
+        - "injetada_kwh": (float) Energia injetada/compensada GD. Se não tiver, use 0.0.
+        - "valor_total": (float) Valor da conta (R$).
         - "custos_extras": (float) Soma de CIP, Multas e Juros.
         - "nome": (string) Nome do cliente.
         - "cidade": (string) Cidade.
@@ -54,18 +85,15 @@ def analisar_com_ia(texto_fatura, chave_api):
         {texto_fatura}
         """
         
-        # Gera a resposta
         response = model.generate_content(prompt)
-        
-        # Limpa a resposta para pegar só o JSON
         texto_limpo = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(texto_limpo)
 
     except Exception as e:
-        st.error(f"Erro na IA: {e}")
+        st.error(f"Erro na IA ({nome_modelo}): {e}")
         return None
 
-# --- LEITOR DE PDF ---
+# --- LEITOR PDF ---
 def ler_pdf(arquivo):
     texto = ""
     with fitz.open(stream=arquivo.read(), filetype="pdf") as doc:
@@ -74,7 +102,7 @@ def ler_pdf(arquivo):
     return texto
 
 # --- TELA PRINCIPAL ---
-st.title("⚡ Auditor-Eon: IA Generativa")
+st.title("⚡ Auditor-Eon: IA Auto-Adaptável")
 
 if 'dados_lidos' not in st.session_state:
     st.session_state['dados_lidos'] = None
@@ -83,16 +111,16 @@ if 'dados_lidos' not in st.session_state:
 uploaded_file = st.file_uploader("Arraste sua conta de luz (PDF)", type=["pdf"])
 
 if uploaded_file and not api_key:
-    st.warning("👈 Cole sua API Key na barra lateral para iniciar.")
+    st.warning("👈 Insira sua API Key na barra lateral.")
 
 if uploaded_file and api_key and st.session_state['dados_lidos'] is None:
-    with st.spinner("A IA está analisando a fatura..."):
+    with st.spinner("Conectando ao Google Gemini e analisando..."):
         texto = ler_pdf(uploaded_file)
         dados_ia = analisar_com_ia(texto, api_key)
         
         if dados_ia:
             st.session_state['dados_lidos'] = dados_ia
-            st.success("Análise Concluída!")
+            st.success("Análise Concluída com Sucesso!")
             st.rerun()
 
 # CALIBRAGEM
