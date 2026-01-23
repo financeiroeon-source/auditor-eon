@@ -22,21 +22,22 @@ with st.sidebar:
     api_key = st.text_input("Cole sua Google API Key aqui:", type="password", help="Pegue sua chave gratuita no Google AI Studio")
     st.markdown("[Criar Chave Gratuita (Google AI Studio)](https://aistudio.google.com/app/apikey)")
     st.divider()
-    st.info("Esta versão usa o modelo **Gemini Flash** para ler a fatura como um humano.")
+    st.info("Modelo Ativo: **Gemini Pro** (Versão Estável)")
 
 # --- FUNÇÃO QUE CHAMA A IA (O CÉREBRO) ---
 def analisar_com_ia(texto_fatura, chave_api):
     try:
         genai.configure(api_key=chave_api)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # TROCAMOS PARA O MODELO MAIS ESTÁVEL PARA EVITAR ERRO 404
+        model = genai.GenerativeModel('gemini-pro')
         
         prompt = f"""
         Você é um Auditor de Energia Especialista (Auditor-Eon).
         Analise o texto extraído de uma fatura de energia elétrica abaixo e extraia os dados em formato JSON estrito.
         
         Regras de Extração:
-        1. 'consumo_kwh': O consumo faturado ou energia ativa da rede (kWh).
-        2. 'injetada_kwh': A energia injetada, compensada ou GD (kWh). Se não houver menção explicita de injeção/GD, assuma 0.0.
+        1. 'consumo_kwh': O consumo faturado ou energia ativa da rede (kWh). Procure por "Consumo", "Energia Ativa" ou "Faturado".
+        2. 'injetada_kwh': A energia injetada, compensada ou GD (kWh). Se não houver menção explicita de injeção/GD, retorne 0.0.
         3. 'valor_total': O valor total a pagar da fatura (R$).
         4. 'custos_extras': Soma de Contribuição Ilum. Pública (CIP), Multas e Juros (R$).
         5. 'nome': Nome do cliente.
@@ -47,16 +48,16 @@ def analisar_com_ia(texto_fatura, chave_api):
         TEXTO DA FATURA:
         {texto_fatura}
 
-        Retorne APENAS o JSON, sem markdown (```json).
+        Responda APENAS com o JSON válido. Não use crases (```).
         """
         
         response = model.generate_content(prompt)
-        # Limpeza do resultado para garantir JSON puro
+        # Limpeza bruta para garantir que venha só o JSON
         json_str = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_str)
         
     except Exception as e:
-        st.error(f"Erro na IA: {e}")
+        st.error(f"Erro na comunicação com a IA: {e}")
         return None
 
 # --- LEITOR DE PDF ---
