@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 import re
+import time
 from calculos import realizar_auditoria_gd
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Auditor-Eon Pro", layout="wide")
 
-# CSS para os Selos
+# CSS para os Selos (CORREÇÃO APLICADA AQUI: unsafe_allow_html=True)
 st.markdown("""
     <style>
     .selo-verde { 
@@ -19,16 +20,17 @@ st.markdown("""
         color: #856404; border: 1px solid #ffeeba; text-align: center; font-weight: bold; font-size: 18px; 
     }
     </style>
-""", unsafe_allow_index=True)
+""", unsafe_allow_html=True)
 
 st.title("⚡ Auditor-Eon: Sistema de Análise GD")
 
-# --- FUNÇÃO DE LEITURA (OCR) RECONSTRUÍDA ---
+# --- FUNÇÃO DE LEITURA (OCR) ---
 def extrair_dados_pdf(arquivo):
     """
     Função que lê o PDF e tenta encontrar os padrões de contas de energia.
     """
     texto_completo = ""
+    # Inicializa com valores padrão para evitar erros de cálculo
     dados = {
         'nome': 'Cliente Identificado',
         'cidade': 'Não identificada',
@@ -49,33 +51,43 @@ def extrair_dados_pdf(arquivo):
         st.error(f"Erro ao ler PDF: {e}")
         return dados
 
-    # --- REGEX PARA CAPTURAR NÚMEROS (PADRÃO BRASILEIRO) ---
-    # Procura por padrões comuns em faturas de energia
+    # --- REGEX PARA CAPTURAR NÚMEROS ---
     
-    # 1. Tenta achar o Valor Total (Ex: "Total a pagar R$ 150,00")
+    # 1. Valor Total
     match_valor = re.search(r'(?:Total a pagar|Valor Total|Total da Fatura).*?R\$\s*([\d\.,]+)', texto_completo, re.IGNORECASE)
     if match_valor:
-        val_str = match_valor.group(1).replace('.', '').replace(',', '.')
-        dados['valor_total'] = float(val_str)
+        try:
+            val_str = match_valor.group(1).replace('.', '').replace(',', '.')
+            dados['valor_total'] = float(val_str)
+        except:
+            pass
 
-    # 2. Tenta achar Consumo Ativo (Ex: "Energia Ativa kWh 450")
-    # Padrão genérico que busca um número perto da palavra kWh
+    # 2. Consumo Ativo (kWh)
     match_consumo = re.search(r'(?:Energia Ativa|Consumo|Fornecimento).*?kWh\s+([\d\.,]+)', texto_completo, re.IGNORECASE)
     if match_consumo:
-        cons_str = match_consumo.group(1).replace('.', '').replace(',', '.')
-        dados['consumo_kwh'] = float(cons_str)
+        try:
+            cons_str = match_consumo.group(1).replace('.', '').replace(',', '.')
+            dados['consumo_kwh'] = float(cons_str)
+        except:
+            pass
 
-    # 3. Tenta achar Energia Injetada (Ex: "Energia Injetada kWh 380")
+    # 3. Energia Injetada (kWh)
     match_injetada = re.search(r'(?:Injetada|Energia Injetada|GD).*?kWh\s+([\d\.,]+)', texto_completo, re.IGNORECASE)
     if match_injetada:
-        inj_str = match_injetada.group(1).replace('.', '').replace(',', '.')
-        dados['injetada_kwh'] = float(inj_str)
+        try:
+            inj_str = match_injetada.group(1).replace('.', '').replace(',', '.')
+            dados['injetada_kwh'] = float(inj_str)
+        except:
+            pass
 
-    # 4. Tenta achar Saldo Anterior (Ex: "Saldo Anterior 1200")
+    # 4. Saldo Anterior
     match_saldo = re.search(r'(?:Saldo Anterior|Saldo Atual|Acumulado).*?([\d\.,]+)', texto_completo, re.IGNORECASE)
     if match_saldo:
-        saldo_str = match_saldo.group(1).replace('.', '').replace(',', '.')
-        dados['saldo_anterior'] = float(saldo_str)
+        try:
+            saldo_str = match_saldo.group(1).replace('.', '').replace(',', '.')
+            dados['saldo_anterior'] = float(saldo_str)
+        except:
+            pass
         
     return dados
 
@@ -90,14 +102,14 @@ uploaded_file = st.file_uploader("Faça o upload da Fatura (PDF)", type=["pdf"])
 
 if uploaded_file is not None and st.session_state['dados_lidos'] is None:
     with st.spinner("Lendo a conta de luz..."):
-        # CHAMA A FUNÇÃO DE LEITURA QUE CRIAMOS ACIMA
         dados_extraidos = extrair_dados_pdf(uploaded_file)
         st.session_state['dados_lidos'] = dados_extraidos
         st.success("Leitura concluída!")
+        time.sleep(1)
         st.rerun()
 
 # ==============================================================================
-# 2. CALIBRAGEM E INPUT (O Cérebro da Análise)
+# 2. CALIBRAGEM E RESULTADOS
 # ==============================================================================
 if st.session_state['dados_lidos']:
     dados = st.session_state['dados_lidos']
@@ -105,12 +117,12 @@ if st.session_state['dados_lidos']:
     st.divider()
     st.subheader("🛠️ Passo 2: Calibragem do Sistema Solar")
     
-    # Se o leitor não achou algum dado, o usuário pode corrigir aqui
+    # Checkpoint de dados lidos (Permite correção manual se o PDF falhar)
     col_check1, col_check2 = st.columns(2)
     with col_check1:
-        dados['consumo_kwh'] = st.number_input("Consumo Lido (Rede):", value=dados['consumo_kwh'])
+        dados['consumo_kwh'] = st.number_input("Consumo Lido (Rede):", value=float(dados['consumo_kwh']))
     with col_check2:
-        dados['injetada_kwh'] = st.number_input("Injeção Lida (Crédito):", value=dados['injetada_kwh'])
+        dados['injetada_kwh'] = st.number_input("Injeção Lida (Crédito):", value=float(dados['injetada_kwh']))
         
     st.markdown("---")
     
@@ -120,10 +132,11 @@ if st.session_state['dados_lidos']:
     
     with col_input:
         # INPUT DA GERAÇÃO
+        valor_sugerido = float(dados.get('injetada_kwh', 0))
         geracao_inversor = st.number_input(
             "Informe a Geração Total (kWh) do Inversor:", 
             min_value=0.0,
-            value=float(dados.get('injetada_kwh', 0)), 
+            value=valor_sugerido, 
             help="Verifique no aplicativo do inversor quanto foi gerado neste mês."
         )
 
@@ -146,11 +159,11 @@ if st.session_state['dados_lidos']:
         
         st.write("") 
 
-        # Linha 2: Selo
+        # Linha 2: Selo (CORREÇÃO APLICADA TAMBÉM AQUI)
         if "Confirmada" in res['selo']:
-            st.markdown(f'<div class="selo-verde">{res["selo"]}</div>', unsafe_allow_index=True)
+            st.markdown(f'<div class="selo-verde">{res["selo"]}</div>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="selo-amarelo">{res["selo"]}</div>', unsafe_allow_index=True)
+            st.markdown(f'<div class="selo-amarelo">{res["selo"]}</div>', unsafe_allow_html=True)
             
         st.divider()
 
@@ -192,3 +205,4 @@ if st.session_state['dados_lidos']:
     if st.button("Nova Análise"):
         st.session_state['dados_lidos'] = None
         st.rerun()
+        
