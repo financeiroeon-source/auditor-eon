@@ -22,61 +22,53 @@ with st.sidebar:
     api_key = st.text_input("Cole sua Google API Key:", type="password")
     st.markdown("[Gerar Chave Gratuita](https://aistudio.google.com/app/apikey)")
     st.divider()
-    st.info("O sistema buscará automaticamente o melhor modelo disponível na sua conta.")
+    st.info("Sistema configurado para diferenciar Consumo Físico de Consumo Faturado (Disp).")
 
-# --- FUNÇÃO INTELIGENTE DE SELEÇÃO DE MODELO ---
+# --- FUNÇÃO: ESCOLHE O MELHOR MODELO (SEM ERRO 404) ---
 def obter_modelo_disponivel():
-    """
-    Lista os modelos disponíveis na conta do usuário e escolhe o melhor,
-    evitando erros de 'Model Not Found'.
-    """
     try:
         modelos = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 modelos.append(m.name)
+        if not modelos: return "gemini-pro"
         
-        # Tenta priorizar o Flash (mais rápido), depois o Pro, depois qualquer um que funcione
-        if not modelos:
-            return "gemini-pro" # Fallback padrão
-            
-        # Procura por ordem de preferência
+        # Prioridade: Flash > Pro 1.5 > Pro 1.0
         for m in modelos:
             if 'flash' in m and '1.5' in m: return m
         for m in modelos:
             if 'pro' in m and '1.5' in m: return m
-        for m in modelos:
-            if 'pro' in m and '1.0' in m: return m
             
-        return modelos[0] # Retorna o primeiro que achar se nenhum favorito estiver lá
+        return modelos[0]
     except:
-        return "gemini-pro" # Se der erro ao listar, tenta o clássico
+        return "gemini-pro"
 
-# --- CÉREBRO DA IA ---
+# --- CÉREBRO DA IA (PROMPT ATUALIZADO) ---
 def analisar_com_ia(texto_fatura, chave_api):
     try:
         genai.configure(api_key=chave_api)
-        
-        # --- AQUI ESTÁ A CORREÇÃO DO ERRO 404 ---
-        # Descobre qual modelo existe de verdade na sua conta
         nome_modelo = obter_modelo_disponivel()
         model = genai.GenerativeModel(nome_modelo)
-        # ----------------------------------------
         
         prompt = f"""
-        Você é um auditor de faturas de energia elétrica.
-        Analise o texto extraído do PDF abaixo e retorne um JSON.
+        Você é um auditor especialista em Geração Distribuída (GD).
+        Analise o texto da fatura e extraia os dados com precisão cirúrgica.
         
-        IMPORTANTE:
-        - Se encontrar números gigantes (ex: 11013876), IGNORE (é leitura de medidor).
-        - Busque o consumo mensal (geralmente entre 50 e 5000 kWh).
+        DIFERENCIAÇÃO IMPORTANTE:
+        1. "consumo_rede_kwh": É a ENERGIA TOTAL que entrou na unidade (Energia Ativa Injetada pela Concessionária). Se houver postos tarifários (Ponta/Fora Ponta), SOME ELES.
+        2. "consumo_faturado_kwh": É a energia que foi EFETIVAMENTE COBRADA. 
+           - Em contas com Solar (GD), se a geração cobriu tudo, este valor será o Custo de Disponibilidade (30, 50 ou 100 kWh).
+           - Se não tiver solar, geralmente é igual ao consumo da rede.
         
-        Campos Obrigatórios (JSON):
-        - "consumo_kwh": (float) Consumo faturado.
-        - "injetada_kwh": (float) Energia injetada/compensada GD. Se não tiver, use 0.0.
-        - "valor_total": (float) Valor da conta (R$).
+        IGNORE números gigantes (ex: 11013876) que são leituras de medidor.
+        
+        Retorne APENAS um JSON com estes campos:
+        - "consumo_rede_kwh": (float) Total físico consumido da rede.
+        - "consumo_faturado_kwh": (float) Total faturado (Disponibilidade ou saldo).
+        - "injetada_kwh": (float) Energia injetada/compensada. Use 0.0 se não achar.
+        - "valor_total": (float) Valor monetário total (R$).
         - "custos_extras": (float) Soma de CIP, Multas e Juros.
-        - "nome": (string) Nome do cliente.
+        - "nome": (string) Nome do Cliente.
         - "cidade": (string) Cidade.
         - "distribuidora": (string) Concessionária.
         - "mes_referencia": (string) Mês/Ano.
@@ -102,7 +94,7 @@ def ler_pdf(arquivo):
     return texto
 
 # --- TELA PRINCIPAL ---
-st.title("⚡ Auditor-Eon: IA Auto-Adaptável")
+st.title("⚡ Auditor-Eon: Análise Detalhada (Rede vs Faturado)")
 
 if 'dados_lidos' not in st.session_state:
     st.session_state['dados_lidos'] = None
@@ -113,60 +105,4 @@ uploaded_file = st.file_uploader("Arraste sua conta de luz (PDF)", type=["pdf"])
 if uploaded_file and not api_key:
     st.warning("👈 Insira sua API Key na barra lateral.")
 
-if uploaded_file and api_key and st.session_state['dados_lidos'] is None:
-    with st.spinner("Conectando ao Google Gemini e analisando..."):
-        texto = ler_pdf(uploaded_file)
-        dados_ia = analisar_com_ia(texto, api_key)
-        
-        if dados_ia:
-            st.session_state['dados_lidos'] = dados_ia
-            st.success("Análise Concluída com Sucesso!")
-            st.rerun()
-
-# CALIBRAGEM
-if st.session_state['dados_lidos']:
-    dados = st.session_state['dados_lidos']
-    
-    st.divider()
-    st.subheader("🛠️ Passo 2: Calibragem")
-    
-    c1, c2, c3 = st.columns(3)
-    with c1: dados['consumo_kwh'] = st.number_input("Consumo (kWh):", value=float(dados.get('consumo_kwh', 0)))
-    with c2: dados['injetada_kwh'] = st.number_input("Injetada (kWh):", value=float(dados.get('injetada_kwh', 0)))
-    with c3: dados['valor_total'] = st.number_input("Valor (R$):", value=float(dados.get('valor_total', 0)))
-
-    st.markdown("---")
-    
-    col_info, col_inp = st.columns([1, 1])
-    with col_info: st.info("Insira a Geração Total do Inversor:")
-    with col_inp:
-        geracao_inversor = st.number_input("Geração Total (kWh):", min_value=0.0, value=float(dados.get('injetada_kwh', 0)))
-
-    if st.button("GERAR AUDITORIA 🚀", type="primary"):
-        res = realizar_auditoria_gd(dados, geracao_inversor)
-        
-        st.markdown("---")
-        st.markdown(f"### 📊 Relatório: {dados.get('nome', 'Cliente')}")
-        
-        if "Confirmada" in res['selo']: st.markdown(f'<div class="selo-verde">{res["selo"]}</div>', unsafe_allow_html=True)
-        else: st.markdown(f'<div class="selo-amarelo">{res["selo"]}</div>', unsafe_allow_html=True)
-            
-        st.divider()
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Economia Real", f"R$ {res['economia_reais']:.2f}")
-        k2.metric("Economia (%)", f"{res['economia_perc']:.1f}%")
-        k3.metric("Autoconsumo", f"{res['consumo_instantaneo']:.0f} kWh")
-        k4.metric("Conta Sem Solar", f"R$ {res['conta_sem_solar']:.2f}")
-        
-        st.divider()
-        ce, cd = st.columns(2)
-        with ce:
-            st.subheader("⚡ Energia")
-            st.dataframe(pd.DataFrame({"Item": ["Consumo Rede", "Geração Total", "Autoconsumo", "Carga Real"], "Valor": [dados['consumo_kwh'], geracao_inversor, res['consumo_instantaneo'], res['carga_total']]}), hide_index=True, use_container_width=True)
-        with cd:
-            st.subheader("💸 Financeiro")
-            st.dataframe(pd.DataFrame({"Item": ["Fatura Atual", "Custos Extras"], "Valor": [dados['valor_total'], dados.get('custos_extras', 0)]}), hide_index=True, use_container_width=True)
-
-    if st.button("Nova Análise"):
-        st.session_state['dados_lidos'] = None
-        st.rerun()
+if uploaded_file and api
