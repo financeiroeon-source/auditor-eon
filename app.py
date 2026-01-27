@@ -4,6 +4,14 @@ import tempfile
 import os
 import json
 import re
+import io
+
+# Tenta importar pypdf para desbloquear senhas
+try:
+    import pypdf
+except ImportError:
+    st.error("⚠️ Biblioteca 'pypdf' não encontrada. No terminal, rode: pip install pypdf")
+    st.stop()
 
 # --- 1. Configuração Visual (MANTIDA IGUAL) ---
 st.set_page_config(
@@ -73,6 +81,39 @@ def limpar_json(texto):
     except:
         return {} 
 
+def verificar_e_desbloquear_pdf(arquivo_bytes, senha=None):
+    """
+    Verifica se o PDF está bloqueado e tenta desbloquear.
+    """
+    try:
+        buffer = io.BytesIO(arquivo_bytes)
+        leitor = pypdf.PdfReader(buffer)
+        
+        if leitor.is_encrypted:
+            if not senha:
+                return None, 'bloqueado'
+            
+            # Tenta desbloquear com a senha
+            try:
+                if leitor.decrypt(senha):
+                    # Cria novo PDF desbloqueado
+                    writer = pypdf.PdfWriter()
+                    for page in leitor.pages:
+                        writer.add_page(page)
+                    
+                    novo_buffer = io.BytesIO()
+                    writer.write(novo_buffer)
+                    novo_buffer.seek(0)
+                    return novo_buffer.getvalue(), 'ok'
+                else:
+                    return None, 'senha_errada'
+            except:
+                return None, 'senha_errada'
+        
+        return arquivo_bytes, 'ok' # Não estava bloqueado
+    except Exception as e:
+        return None, f"erro_leitura: {e}"
+
 def extrair_datas(pdf_path, modelo):
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
@@ -87,7 +128,7 @@ def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
     
-    # --- AQUI FOI O AJUSTE FINO NO CÉREBRO ---
+    # --- PROMPT MANTIDO EXATAMENTE IGUAL ---
     prompt = f"""
     ATUE COMO: Auditor Técnico Sênior de Energia Solar.
     
@@ -121,7 +162,7 @@ def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
         res = model.generate_content([file_ref, prompt])
         return limpar_json(res.text)
 
-# --- 4. Interface (MANTIDA IGUAL) ---
+# --- 4. Interface ---
 
 modelo_ativo = selecionar_modelo_auto()
 
@@ -133,8 +174,10 @@ with col_titulo:
 
 st.markdown("---")
 
+# Inicialização de Variáveis de Sessão
 if 'dados_fatura' not in st.session_state: st.session_state['dados_fatura'] = None
 if 'etapa' not in st.session_state: st.session_state['etapa'] = 1
+if 'pdf_processado' not in st.session_state: st.session_state['pdf_processado'] = None
 
 container = st.container()
 
@@ -143,58 +186,90 @@ with container:
     uploaded_file = st.file_uploader("Upload da Fatura", type=["pdf"], label_visibility="collapsed")
 
     if uploaded_file:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
-
-        if st.session_state['etapa'] == 1:
-            if st.button("▶️ Ler Fatura", type="primary"):
-                with st.status("Lendo dados...", expanded=True) as status:
-                    try:
-                        datas = extrair_datas(tmp_path, modelo_ativo)
-                        st.session_state['dados_fatura'] = datas
-                        st.session_state['etapa'] = 2
-                        status.update(label="✅ Sucesso!", state="complete", expanded=False)
+        # --- LÓGICA DE SENHA (NOVO) ---
+        if st.session_state['pdf_processado'] is None:
+            bytes_iniciais = uploaded_file.getvalue()
+            pdf_final, status = verificar_e_desbloquear_pdf(bytes_iniciais)
+            
+            if status == 'bloqueado':
+                st.warning("🔒 Arquivo protegido por senha.")
+                col_pass, col_ok = st.columns([3, 1])
+                senha = col_pass.text_input("Digite a senha (geralmente 5 primeiros dígitos do CPF):", type="password")
+                
+                if senha:
+                    pdf_desbloqueado, status_senha = verificar_e_desbloquear_pdf(bytes_iniciais, senha)
+                    if status_senha == 'ok':
+                        st.session_state['pdf_processado'] = pdf_desbloqueado
+                        st.success("🔓 Desbloqueado!")
                         st.rerun()
-                    except Exception as e:
-                        status.update(label="❌ Erro", state="error")
-                        st.error(str(e))
+                    else:
+                        st.error("❌ Senha incorreta.")
+                st.stop() # Para aqui até desbloquear
+            
+            elif status == 'ok':
+                st.session_state['pdf_processado'] = pdf_final
+            else:
+                st.error(f"Erro no PDF: {status}")
+                st.stop()
 
-        if st.session_state['etapa'] >= 2:
-            datas = st.session_state['dados_fatura'] or {}
-            st.markdown("---")
-            st.subheader("☀️ 2. Usina")
-            st.info(f"Período: **{datas.get('inicio', '?')}** a **{datas.get('fim', '?')}**")
-            
-            c1, c2 = st.columns([2, 1])
-            geracao_input = c1.number_input("Geração (kWh):", min_value=0, step=10)
-            
-            if c2.button("🚀 Gerar Relatório", type="primary"):
-                if geracao_input > 0:
-                    with st.spinner("Auditor trabalhando..."):
+        # --- FLUXO NORMAL (Usando o PDF processado) ---
+        if st.session_state['pdf_processado']:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(st.session_state['pdf_processado'])
+                tmp_path = tmp_file.name
+
+            if st.session_state['etapa'] == 1:
+                if st.button("▶️ Ler Fatura", type="primary"):
+                    with st.status("Lendo dados...", expanded=True) as status:
                         try:
-                            dados = analisar_performance_completa(tmp_path, modelo_ativo, geracao_input)
-                            
-                            st.markdown("---")
-                            st.subheader("🎯 Resultado Financeiro")
-                            
-                            met = dados.get("metricas", {})
-                            k1, k2, k3, k4 = st.columns(4)
-                            k1.metric("Atual", met.get("conta_atual", "-"))
-                            k2.metric("Sem Solar", met.get("sem_solar", "-"), delta="Evitado", delta_color="inverse")
-                            k3.metric("Economia", met.get("economia", "-"))
-                            k4.metric("ROI", met.get("pct", "-"))
-
-                            with st.expander("📄 Relatório Técnico", expanded=True):
-                                st.markdown(dados.get("relatorio", ""))
-
-                            st.success("📲 WhatsApp:")
-                            st.code(dados.get("whatsapp", ""), language="text")
-                            
-                            if st.button("Nova Análise"):
-                                st.session_state['etapa'] = 1
-                                st.rerun()
+                            datas = extrair_datas(tmp_path, modelo_ativo)
+                            st.session_state['dados_fatura'] = datas
+                            st.session_state['etapa'] = 2
+                            status.update(label="✅ Sucesso!", state="complete", expanded=False)
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Erro na análise: {e}")
-                else:
-                    st.warning("Digite a geração.")
+                            status.update(label="❌ Erro", state="error")
+                            st.error(str(e))
+
+            if st.session_state['etapa'] >= 2:
+                datas = st.session_state['dados_fatura'] or {}
+                st.markdown("---")
+                st.subheader("☀️ 2. Usina")
+                st.info(f"Período: **{datas.get('inicio', '?')}** a **{datas.get('fim', '?')}**")
+                
+                c1, c2 = st.columns([2, 1])
+                geracao_input = c1.number_input("Geração (kWh):", min_value=0, step=10)
+                
+                if c2.button("🚀 Gerar Relatório", type="primary"):
+                    if geracao_input > 0:
+                        with st.spinner("Auditor trabalhando..."):
+                            try:
+                                dados = analisar_performance_completa(tmp_path, modelo_ativo, geracao_input)
+                                
+                                st.markdown("---")
+                                st.subheader("🎯 Resultado Financeiro")
+                                
+                                met = dados.get("metricas", {})
+                                k1, k2, k3, k4 = st.columns(4)
+                                k1.metric("Atual", met.get("conta_atual", "-"))
+                                k2.metric("Sem Solar", met.get("sem_solar", "-"), delta="Evitado", delta_color="inverse")
+                                k3.metric("Economia", met.get("economia", "-"))
+                                k4.metric("ROI", met.get("pct", "-"))
+
+                                with st.expander("📄 Relatório Técnico", expanded=True):
+                                    st.markdown(dados.get("relatorio", ""))
+
+                                st.success("📲 WhatsApp:")
+                                st.code(dados.get("whatsapp", ""), language="text")
+                                
+                                if st.button("Nova Análise"):
+                                    st.session_state['etapa'] = 1
+                                    st.session_state['pdf_processado'] = None
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro na análise: {e}")
+                    else:
+                        st.warning("Digite a geração.")
+    else:
+        # Reseta se o usuário remover o arquivo da tela
+        st.session_state['pdf_processado'] = None
