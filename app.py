@@ -5,6 +5,7 @@ import os
 import json
 import re
 import io
+import time # Adicionado para pausas de segurança
 
 # Tenta importar pypdf para desbloquear senhas
 try:
@@ -60,18 +61,11 @@ except Exception as e:
     st.error(f"Erro de conexão: {e}")
     st.stop()
 
-# --- 3. Funções Inteligentes ---
+# --- 3. Funções Inteligentes (ATUALIZADAS PARA MODO PRO) ---
 
-def selecionar_modelo_auto():
-    try:
-        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        preferencias = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        for pref in preferencias:
-            for m in modelos:
-                if pref in m: return m
-        return "models/gemini-1.5-flash"
-    except:
-        return "models/gemini-1.5-flash"
+def selecionar_modelo_pro():
+    # Fixado no 1.5 Pro para máxima inteligência
+    return "models/gemini-1.5-pro"
 
 def limpar_json(texto):
     try:
@@ -115,16 +109,23 @@ def verificar_e_desbloquear_pdf(arquivo_bytes, senha=None):
         return None, f"erro_leitura: {e}"
 
 def extrair_datas(pdf_path, modelo):
+    # Pausa técnica para evitar erro 429 (Too Many Requests) no plano gratuito
+    time.sleep(1)
+    
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
     prompt = 'Extraia as datas da conta (Leitura Anterior e Atual). JSON: { "inicio": "DD/MM", "fim": "DD/MM", "dias": "XX" }'
     try:
-        res = model.generate_content([file_ref, prompt])
+        # Temperature 0.0 = Criatividade Zero (Consistência)
+        res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
         return limpar_json(res.text)
     except:
         return {"inicio": "?", "fim": "?", "dias": "?"}
 
 def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
+    # Pausa técnica: O modelo Pro é pesado, damos 2s para o Google respirar
+    time.sleep(2)
+    
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
     
@@ -156,21 +157,28 @@ def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
     """
     
     try:
-        res = model.generate_content([file_ref, prompt], generation_config={"response_mime_type": "application/json"})
+        # Temperature 0.0 aqui também!
+        res = model.generate_content(
+            [file_ref, prompt], 
+            generation_config={"response_mime_type": "application/json", "temperature": 0.0}
+        )
         return json.loads(res.text)
     except:
-        res = model.generate_content([file_ref, prompt])
+        # Fallback também com temperatura zero
+        res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
         return limpar_json(res.text)
 
 # --- 4. Interface ---
 
-modelo_ativo = selecionar_modelo_auto()
+# Agora chamamos a função PRO
+modelo_ativo = selecionar_modelo_pro()
 
 col_logo, col_titulo = st.columns([1, 5])
 with col_logo: st.markdown("# ⚡")
 with col_titulo:
     st.title("Portal Auditor Eon")
-    st.caption(f"Motor IA: {modelo_ativo}")
+    # Atualizei o caption para você saber que está rodando o Pro
+    st.caption(f"Motor IA: {modelo_ativo} | Precisão Máxima (Temp 0.0)")
 
 st.markdown("---")
 
@@ -186,7 +194,7 @@ with container:
     uploaded_file = st.file_uploader("Upload da Fatura", type=["pdf"], label_visibility="collapsed")
 
     if uploaded_file:
-        # --- LÓGICA DE SENHA (NOVO) ---
+        # --- LÓGICA DE SENHA (MANTIDA) ---
         if st.session_state['pdf_processado'] is None:
             bytes_iniciais = uploaded_file.getvalue()
             pdf_final, status = verificar_e_desbloquear_pdf(bytes_iniciais)
@@ -220,7 +228,7 @@ with container:
 
             if st.session_state['etapa'] == 1:
                 if st.button("▶️ Ler Fatura", type="primary"):
-                    with st.status("Lendo dados...", expanded=True) as status:
+                    with st.status("Lendo dados (Modo Pro)...", expanded=True) as status:
                         try:
                             datas = extrair_datas(tmp_path, modelo_ativo)
                             st.session_state['dados_fatura'] = datas
@@ -242,7 +250,7 @@ with container:
                 
                 if c2.button("🚀 Gerar Relatório", type="primary"):
                     if geracao_input > 0:
-                        with st.spinner("Auditor trabalhando..."):
+                        with st.spinner("Auditor trabalhando (Pode levar ~15 seg)..."):
                             try:
                                 dados = analisar_performance_completa(tmp_path, modelo_ativo, geracao_input)
                                 
@@ -267,7 +275,7 @@ with container:
                                     st.session_state['pdf_processado'] = None
                                     st.rerun()
                             except Exception as e:
-                                st.error(f"Erro na análise: {e}")
+                                st.error(f"Erro na análise: {e}. Se for '429', aguarde 1 minuto.")
                     else:
                         st.warning("Digite a geração.")
     else:
