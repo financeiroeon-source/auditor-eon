@@ -60,11 +60,25 @@ except Exception as e:
     st.error(f"Erro de conexão: {e}")
     st.stop()
 
-# --- 3. Funções Inteligentes (MODO PRO ATIVADO) ---
+# --- 3. Funções Inteligentes (CORRIGIDA PARA NÃO DAR ERRO 404) ---
 
 def selecionar_modelo_pro():
-    # Agora que você paga, usamos o MELHOR sem medo.
-    return "models/gemini-1.5-pro"
+    """
+    Busca dinamicamente o nome correto do modelo PRO na conta do usuário.
+    """
+    try:
+        # Lista todos os modelos que sua chave tem acesso
+        modelos_disponiveis = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # 1. Tenta achar qualquer variante do 1.5 Pro (ex: models/gemini-1.5-pro-001)
+        for m in modelos_disponiveis:
+            if "gemini-1.5-pro" in m: return m
+            
+        # 2. Se não achar Pro, tenta o Flash 1.5 como segurança
+        return "models/gemini-1.5-flash"
+    except:
+        # Em caso de erro total na listagem, usa o fallback padrão
+        return "models/gemini-1.5-flash"
 
 def limpar_json(texto):
     try:
@@ -96,19 +110,18 @@ def verificar_e_desbloquear_pdf(arquivo_bytes, senha=None):
         return None, f"erro_leitura: {e}"
 
 def extrair_datas(pdf_path, modelo):
-    # Sem time.sleep() -> Velocidade Máxima 🚀
+    # Sem pausas (Modo Turbo)
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
     prompt = 'Extraia as datas da conta (Leitura Anterior e Atual). JSON: { "inicio": "DD/MM", "fim": "DD/MM", "dias": "XX" }'
     try:
-        # Temperature 0.0 para precisão máxima
         res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
         return limpar_json(res.text)
     except:
         return {"inicio": "?", "fim": "?", "dias": "?"}
 
 def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
-    # Sem time.sleep() -> O Google Cloud aguenta o tranco agora.
+    # Sem pausas (Modo Turbo)
     model = genai.GenerativeModel(modelo)
     file_ref = genai.upload_file(pdf_path)
     
@@ -150,6 +163,7 @@ def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
 
 # --- 4. Interface ---
 
+# AQUI ELE VAI BUSCAR O NOME CERTO SOZINHO
 modelo_ativo = selecionar_modelo_pro()
 
 col_logo, col_titulo = st.columns([1, 5])
