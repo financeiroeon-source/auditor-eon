@@ -64,8 +64,23 @@ except Exception as e:
 # --- 3. Funções Inteligentes (ATUALIZADAS PARA MODO PRO) ---
 
 def selecionar_modelo_pro():
-    # Fixado no 1.5 Pro para máxima inteligência
-    return "models/gemini-1.5-pro"
+    # Tenta listar os modelos disponíveis na sua conta para pegar o nome exato
+    try:
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # 1. Tenta o PRO mais recente
+        for m in modelos:
+            if "gemini-1.5-pro" in m: return m
+            
+        # 2. Se não achar o PRO, tenta o 2.0 Flash (que é melhor que o 1.5 Flash)
+        for m in modelos:
+            if "gemini-2.0-flash" in m: return m
+            
+        # 3. Fallback para o clássico
+        return "models/gemini-1.5-flash"
+    except:
+        # Se der erro na listagem, usa o nome padrão seguro
+        return "models/gemini-1.5-flash"
 
 def limpar_json(texto):
     try:
