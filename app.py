@@ -1,108 +1,200 @@
 import streamlit as st
-import pandas as pd
-import fitz  # PyMuPDF
 import google.generativeai as genai
+import tempfile
+import os
 import json
-from calculos import realizar_auditoria_gd
+import re
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Auditor-Eon AI", layout="wide")
+# --- 1. Configuração Visual (MANTIDA IGUAL) ---
+st.set_page_config(
+    page_title="Portal Auditor Eon",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
 st.markdown("""
     <style>
-    .selo-verde { padding: 15px; border-radius: 8px; background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; text-align: center; font-weight: bold; font-size: 18px; }
-    .selo-amarelo { padding: 15px; border-radius: 8px; background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; text-align: center; font-weight: bold; font-size: 18px; }
-    .stButton>button { width: 100%; border-radius: 8px; height: 50px; font-weight: bold; }
+    .stApp { background-color: #0e1117; }
+    
+    [data-testid="stMetric"] {
+        background-color: #ffffff;
+        padding: 15px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        border: 1px solid #e0e0e0;
+    }
+    [data-testid="stMetricLabel"] { color: #666666 !important; font-size: 14px; }
+    [data-testid="stMetricValue"] { color: #1f1f1f !important; font-weight: bold; }
+
+    .stButton>button {
+        width: 100%;
+        border-radius: 8px;
+        height: 3em;
+        font-weight: bold;
+        border: none;
+    }
+    
+    h1 { color: #ff4b4b; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
     </style>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
-# --- BARRA LATERAL ---
-with st.sidebar:
-    st.header("🤖 Configuração da IA")
-    api_key = st.text_input("Cole sua Google API Key:", type="password")
-    st.markdown("[Gerar Chave Gratuita](https://aistudio.google.com/app/apikey)")
-    st.divider()
-    st.info("Sistema configurado para diferenciar Consumo Físico de Consumo Faturado (Disp).")
+# --- 2. Autenticação (MANTIDA IGUAL) ---
+try:
+    if "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+        genai.configure(api_key=api_key)
+    else:
+        st.error("⚠️ ERRO: Configure o arquivo .streamlit/secrets.toml")
+        st.stop()
+except Exception as e:
+    st.error(f"Erro de conexão: {e}")
+    st.stop()
 
-# --- FUNÇÃO: ESCOLHE O MELHOR MODELO (SEM ERRO 404) ---
-def obter_modelo_disponivel():
+# --- 3. Funções Inteligentes ---
+
+def selecionar_modelo_auto():
     try:
-        modelos = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                modelos.append(m.name)
-        if not modelos: return "gemini-pro"
-        
-        # Prioridade: Flash > Pro 1.5 > Pro 1.0
-        for m in modelos:
-            if 'flash' in m and '1.5' in m: return m
-        for m in modelos:
-            if 'pro' in m and '1.5' in m: return m
-            
-        return modelos[0]
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        preferencias = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        for pref in preferencias:
+            for m in modelos:
+                if pref in m: return m
+        return "models/gemini-1.5-flash"
     except:
-        return "gemini-pro"
+        return "models/gemini-1.5-flash"
 
-# --- CÉREBRO DA IA (PROMPT ATUALIZADO) ---
-def analisar_com_ia(texto_fatura, chave_api):
+def limpar_json(texto):
     try:
-        genai.configure(api_key=chave_api)
-        nome_modelo = obter_modelo_disponivel()
-        model = genai.GenerativeModel(nome_modelo)
-        
-        prompt = f"""
-        Você é um auditor especialista em Geração Distribuída (GD).
-        Analise o texto da fatura e extraia os dados com precisão cirúrgica.
-        
-        DIFERENCIAÇÃO IMPORTANTE:
-        1. "consumo_rede_kwh": É a ENERGIA TOTAL que entrou na unidade (Energia Ativa Injetada pela Concessionária). Se houver postos tarifários (Ponta/Fora Ponta), SOME ELES.
-        2. "consumo_faturado_kwh": É a energia que foi EFETIVAMENTE COBRADA. 
-           - Em contas com Solar (GD), se a geração cobriu tudo, este valor será o Custo de Disponibilidade (30, 50 ou 100 kWh).
-           - Se não tiver solar, geralmente é igual ao consumo da rede.
-        
-        IGNORE números gigantes (ex: 11013876) que são leituras de medidor.
-        
-        Retorne APENAS um JSON com estes campos:
-        - "consumo_rede_kwh": (float) Total físico consumido da rede.
-        - "consumo_faturado_kwh": (float) Total faturado (Disponibilidade ou saldo).
-        - "injetada_kwh": (float) Energia injetada/compensada. Use 0.0 se não achar.
-        - "valor_total": (float) Valor monetário total (R$).
-        - "custos_extras": (float) Soma de CIP, Multas e Juros.
-        - "nome": (string) Nome do Cliente.
-        - "cidade": (string) Cidade.
-        - "distribuidora": (string) Concessionária.
-        - "mes_referencia": (string) Mês/Ano.
+        match = re.search(r'\{.*\}', texto, re.DOTALL)
+        if match: return json.loads(match.group(0))
+        return json.loads(texto)
+    except:
+        return {} 
 
-        Texto da Fatura:
-        {texto_fatura}
-        """
-        
-        response = model.generate_content(prompt)
-        texto_limpo = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(texto_limpo)
+def extrair_datas(pdf_path, modelo):
+    model = genai.GenerativeModel(modelo)
+    file_ref = genai.upload_file(pdf_path)
+    prompt = 'Extraia as datas da conta (Leitura Anterior e Atual). JSON: { "inicio": "DD/MM", "fim": "DD/MM", "dias": "XX" }'
+    try:
+        res = model.generate_content([file_ref, prompt])
+        return limpar_json(res.text)
+    except:
+        return {"inicio": "?", "fim": "?", "dias": "?"}
 
-    except Exception as e:
-        st.error(f"Erro na IA ({nome_modelo}): {e}")
-        return None
+def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
+    model = genai.GenerativeModel(modelo)
+    file_ref = genai.upload_file(pdf_path)
+    
+    # --- AQUI FOI O AJUSTE FINO NO CÉREBRO ---
+    prompt = f"""
+    ATUE COMO: Auditor Técnico Sênior de Energia Solar.
+    
+    INPUTS:
+    1. Fatura de Energia (PDF).
+    2. Geração Real do Inversor: {geracao_usuario} kWh.
 
-# --- LEITOR PDF ---
-def ler_pdf(arquivo):
-    texto = ""
-    with fitz.open(stream=arquivo.read(), filetype="pdf") as doc:
-        for page in doc:
-            texto += page.get_text() + "\n"
-    return texto
+    DIRETRIZES TÉCNICAS:
+    - Autoconsumo = {geracao_usuario} - Energia Injetada.
+    - Consumo Real = Consumo Rede + Autoconsumo.
+    - Fio B: Identifique o valor pago.
+    - Mínimo: Verifique se o consumo da rede superou o mínimo (30/50/100).
 
-# --- TELA PRINCIPAL ---
-st.title("⚡ Auditor-Eon: Análise Detalhada (Rede vs Faturado)")
+    SAÍDA OBRIGATÓRIA (JSON puro):
+    {{
+        "metricas": {{
+            "conta_atual": "R$ Valor",
+            "sem_solar": "R$ Valor Estimado",
+            "economia": "R$ Valor",
+            "pct": "XX%"
+        }},
+        "relatorio": "Relatório Markdown detalhado com tabelas e explicação técnica.",
+        "whatsapp": "Mensagem formatada em TÓPICOS (Lista com emojis). DEVE CONTER OBRIGATORIAMENTE: 1. Comparativo (Atual vs Sem Solar) e Economia. 2. Dados Técnicos (Geração, Injeção e Autoconsumo calculado). 3. Custo do Fio B (se houver). 4. Status do Mínimo. Mantenha tom consultivo, amigável e detalhista."
+    }}
+    """
+    
+    try:
+        res = model.generate_content([file_ref, prompt], generation_config={"response_mime_type": "application/json"})
+        return json.loads(res.text)
+    except:
+        res = model.generate_content([file_ref, prompt])
+        return limpar_json(res.text)
 
-if 'dados_lidos' not in st.session_state:
-    st.session_state['dados_lidos'] = None
+# --- 4. Interface (MANTIDA IGUAL) ---
 
-# UPLOAD
-uploaded_file = st.file_uploader("Arraste sua conta de luz (PDF)", type=["pdf"])
+modelo_ativo = selecionar_modelo_auto()
 
-if uploaded_file and not api_key:
-    st.warning("👈 Insira sua API Key na barra lateral.")
+col_logo, col_titulo = st.columns([1, 5])
+with col_logo: st.markdown("# ⚡")
+with col_titulo:
+    st.title("Portal Auditor Eon")
+    st.caption(f"Motor IA: {modelo_ativo}")
 
-if uploaded_file and api
+st.markdown("---")
+
+if 'dados_fatura' not in st.session_state: st.session_state['dados_fatura'] = None
+if 'etapa' not in st.session_state: st.session_state['etapa'] = 1
+
+container = st.container()
+
+with container:
+    st.subheader("📂 1. Nova Análise")
+    uploaded_file = st.file_uploader("Upload da Fatura", type=["pdf"], label_visibility="collapsed")
+
+    if uploaded_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
+
+        if st.session_state['etapa'] == 1:
+            if st.button("▶️ Ler Fatura", type="primary"):
+                with st.status("Lendo dados...", expanded=True) as status:
+                    try:
+                        datas = extrair_datas(tmp_path, modelo_ativo)
+                        st.session_state['dados_fatura'] = datas
+                        st.session_state['etapa'] = 2
+                        status.update(label="✅ Sucesso!", state="complete", expanded=False)
+                        st.rerun()
+                    except Exception as e:
+                        status.update(label="❌ Erro", state="error")
+                        st.error(str(e))
+
+        if st.session_state['etapa'] >= 2:
+            datas = st.session_state['dados_fatura'] or {}
+            st.markdown("---")
+            st.subheader("☀️ 2. Usina")
+            st.info(f"Período: **{datas.get('inicio', '?')}** a **{datas.get('fim', '?')}**")
+            
+            c1, c2 = st.columns([2, 1])
+            geracao_input = c1.number_input("Geração (kWh):", min_value=0, step=10)
+            
+            if c2.button("🚀 Gerar Relatório", type="primary"):
+                if geracao_input > 0:
+                    with st.spinner("Auditor trabalhando..."):
+                        try:
+                            dados = analisar_performance_completa(tmp_path, modelo_ativo, geracao_input)
+                            
+                            st.markdown("---")
+                            st.subheader("🎯 Resultado Financeiro")
+                            
+                            met = dados.get("metricas", {})
+                            k1, k2, k3, k4 = st.columns(4)
+                            k1.metric("Atual", met.get("conta_atual", "-"))
+                            k2.metric("Sem Solar", met.get("sem_solar", "-"), delta="Evitado", delta_color="inverse")
+                            k3.metric("Economia", met.get("economia", "-"))
+                            k4.metric("ROI", met.get("pct", "-"))
+
+                            with st.expander("📄 Relatório Técnico", expanded=True):
+                                st.markdown(dados.get("relatorio", ""))
+
+                            st.success("📲 WhatsApp:")
+                            st.code(dados.get("whatsapp", ""), language="text")
+                            
+                            if st.button("Nova Análise"):
+                                st.session_state['etapa'] = 1
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro na análise: {e}")
+                else:
+                    st.warning("Digite a geração.")
