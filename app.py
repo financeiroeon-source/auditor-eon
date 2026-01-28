@@ -6,6 +6,14 @@ import json
 import re
 import io
 
+import streamlit as st
+import google.generativeai as genai
+
+# --- CÓDIGO DE DIAGNÓSTICO (Apague depois de resolver) ---
+st.sidebar.error(f"Versão da Biblioteca Google: {genai.__version__}")
+st.sidebar.warning("Para funcionar o 1.5, a versão TEM que ser maior que 0.8.3")
+# ---------------------------------------------------------
+
 # Tenta importar pypdf
 try:
     import pypdf
