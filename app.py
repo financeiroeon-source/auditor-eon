@@ -5,14 +5,7 @@ import os
 import json
 import re
 import io
-
-import streamlit as st
-import google.generativeai as genai
-
-# --- CÓDIGO DE DIAGNÓSTICO (Apague depois de resolver) ---
-st.sidebar.error(f"Versão da Biblioteca Google: {genai.__version__}")
-st.sidebar.warning("Para funcionar o 1.5, a versão TEM que ser maior que 0.8.3")
-# ---------------------------------------------------------
+import time
 
 # Tenta importar pypdf
 try:
@@ -23,7 +16,7 @@ except ImportError:
 
 # --- 1. Configuração Visual ---
 st.set_page_config(
-    page_title="Portal Auditor Eon (PRO)",
+    page_title="Portal Auditor Eon",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -32,31 +25,12 @@ st.set_page_config(
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
-    
-    [data-testid="stMetric"] {
-        background-color: #ffffff;
-        padding: 15px;
-        border-radius: 12px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
-        border: 1px solid #e0e0e0;
-    }
-    [data-testid="stMetricLabel"] { color: #666666 !important; font-size: 14px; }
-    [data-testid="stMetricValue"] { color: #1f1f1f !important; font-weight: bold; }
-
-    .stButton>button {
-        width: 100%;
-        border-radius: 8px;
-        height: 3em;
-        font-weight: bold;
-        border: none;
-    }
-    
+    .stButton>button { width: 100%; border-radius: 8px; height: 3em; font-weight: bold; border: none; }
     h1 { color: #ff4b4b; }
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. Autenticação ---
+# --- 2. Autenticação e Diagnóstico ---
 try:
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
@@ -68,27 +42,67 @@ except Exception as e:
     st.error(f"Erro de conexão: {e}")
     st.stop()
 
-# --- 3. Funções Inteligentes (CORRIGIDA PARA NÃO DAR ERRO 404) ---
+# --- 3. Funções Inteligentes (COM FALLBACK DE SEGURANÇA) ---
 
-def selecionar_modelo_pro():
-    """
-    Busca dinamicamente o nome correto do modelo PRO na conta do usuário.
-    """
+def tentar_modelo(nome_modelo, prompt, file_ref):
+    """Tenta gerar conteúdo com um modelo específico. Retorna o resultado ou None se falhar."""
     try:
-        # Lista todos os modelos que sua chave tem acesso
-        modelos_disponiveis = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 1. Tenta achar qualquer variante do 1.5 Pro (ex: models/gemini-1.5-pro-001)
-        for m in modelos_disponiveis:
-            if "gemini-1.5-pro" in m: return m
-            
-        # 2. Se não achar Pro, tenta o Flash 1.5 como segurança
-        return "models/gemini-1.5-flash"
-    except:
-        # Em caso de erro total na listagem, usa o fallback padrão
-        return "models/gemini-1.5-flash"
+        model = genai.GenerativeModel(nome_modelo)
+        # Tenta com temperature 0 para precisão
+        res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
+        return res
+    except Exception:
+        return None
 
-def limpar_json(texto):
+def processar_inteligente(pdf_path, prompt_texto, tipo_retorno="json"):
+    """
+    Tenta o Gemini 1.5 Pro. Se falhar (erro 404), tenta o Gemini 1.5 Flash.
+    Se falhar, usa o Gemini 1.0 Pro (Tanque de Guerra).
+    """
+    file_ref = genai.upload_file(pdf_path)
+    
+    # 1. Tentativa: O melhor (1.5 Pro)
+    modelos_para_tentar = ["models/gemini-1.5-pro", "gemini-1.5-pro"]
+    
+    # Se a biblioteca for velha, ela só aceita 'gemini-pro'
+    try:
+        if genai.__version__ < "0.4.0":
+            modelos_para_tentar = ["gemini-pro"]
+    except:
+        pass # Se não der pra ler a versão, segue o jogo
+
+    # Adiciona os fallbacks
+    modelos_para_tentar.extend(["models/gemini-1.5-flash", "gemini-1.5-flash", "models/gemini-pro", "gemini-pro"])
+
+    ultimo_erro = ""
+
+    for modelo_nome in modelos_para_tentar:
+        try:
+            model = genai.GenerativeModel(modelo_nome)
+            
+            # Configuração específica para JSON se solicitado
+            config = {"temperature": 0.0}
+            if tipo_retorno == "json" and "1.5" in modelo_nome:
+                config["response_mime_type"] = "application/json"
+            
+            res = model.generate_content([file_ref, prompt_texto], generation_config=config)
+            
+            # Se chegou aqui, funcionou!
+            # Vamos mostrar qual modelo salvou a pátria (só pra debug)
+            # st.toast(f"Usando modelo: {modelo_nome}") 
+            
+            if tipo_retorno == "json":
+                return json.loads(res.text) if "1.5" in modelo_nome else limpar_json_manual(res.text)
+            return limpar_json_manual(res.text)
+            
+        except Exception as e:
+            ultimo_erro = str(e)
+            continue # Tenta o próximo da lista
+
+    # Se todos falharem
+    raise Exception(f"Falha em todos os modelos. Último erro: {ultimo_erro}")
+
+def limpar_json_manual(texto):
     try:
         match = re.search(r'\{.*\}', texto, re.DOTALL)
         if match: return json.loads(match.group(0))
@@ -100,91 +114,32 @@ def verificar_e_desbloquear_pdf(arquivo_bytes, senha=None):
     try:
         buffer = io.BytesIO(arquivo_bytes)
         leitor = pypdf.PdfReader(buffer)
-        
         if leitor.is_encrypted:
             if not senha: return None, 'bloqueado'
-            try:
-                if leitor.decrypt(senha):
-                    writer = pypdf.PdfWriter()
-                    for page in leitor.pages: writer.add_page(page)
-                    novo_buffer = io.BytesIO()
-                    writer.write(novo_buffer)
-                    novo_buffer.seek(0)
-                    return novo_buffer.getvalue(), 'ok'
-                else: return None, 'senha_errada'
-            except: return None, 'senha_errada'
+            if leitor.decrypt(senha):
+                writer = pypdf.PdfWriter()
+                for page in leitor.pages: writer.add_page(page)
+                novo_buffer = io.BytesIO()
+                writer.write(novo_buffer)
+                novo_buffer.seek(0)
+                return novo_buffer.getvalue(), 'ok'
+            return None, 'senha_errada'
         return arquivo_bytes, 'ok'
-    except Exception as e:
-        return None, f"erro_leitura: {e}"
-
-def extrair_datas(pdf_path, modelo):
-    # Sem pausas (Modo Turbo)
-    model = genai.GenerativeModel(modelo)
-    file_ref = genai.upload_file(pdf_path)
-    prompt = 'Extraia as datas da conta (Leitura Anterior e Atual). JSON: { "inicio": "DD/MM", "fim": "DD/MM", "dias": "XX" }'
-    try:
-        res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
-        return limpar_json(res.text)
-    except:
-        return {"inicio": "?", "fim": "?", "dias": "?"}
-
-def analisar_performance_completa(pdf_path, modelo, geracao_usuario):
-    # Sem pausas (Modo Turbo)
-    model = genai.GenerativeModel(modelo)
-    file_ref = genai.upload_file(pdf_path)
-    
-    prompt = f"""
-    ATUE COMO: Auditor Técnico Sênior de Energia Solar.
-    
-    INPUTS:
-    1. Fatura de Energia (PDF).
-    2. Geração Real do Inversor: {geracao_usuario} kWh.
-
-    DIRETRIZES TÉCNICAS RÍGIDAS (Seja Literal):
-    - Autoconsumo = {geracao_usuario} - Energia Injetada (Valor exato da conta).
-    - Consumo Real = Consumo Rede + Autoconsumo.
-    - Fio B: Identifique o valor pago explicitamente.
-    - Mínimo: Verifique se o consumo da rede superou o mínimo (30/50/100).
-
-    SAÍDA OBRIGATÓRIA (JSON puro):
-    {{
-        "metricas": {{
-            "conta_atual": "R$ Valor",
-            "sem_solar": "R$ Valor Estimado",
-            "economia": "R$ Valor",
-            "pct": "XX%"
-        }},
-        "relatorio": "Relatório Markdown detalhado com tabelas e explicação técnica.",
-        "whatsapp": "Mensagem formatada em TÓPICOS (Lista com emojis). DEVE CONTER OBRIGATORIAMENTE: 1. Comparativo (Atual vs Sem Solar) e Economia. 2. Dados Técnicos (Geração, Injeção e Autoconsumo calculado). 3. Custo do Fio B (se houver). 4. Status do Mínimo."
-    }}
-    """
-    
-    try:
-        res = model.generate_content(
-            [file_ref, prompt], 
-            generation_config={"response_mime_type": "application/json", "temperature": 0.0}
-        )
-        return json.loads(res.text)
-    except:
-        res = model.generate_content([file_ref, prompt], generation_config={"temperature": 0.0})
-        return limpar_json(res.text)
+    except: return None, 'erro_leitura'
 
 # --- 4. Interface ---
-
-# AQUI ELE VAI BUSCAR O NOME CERTO SOZINHO
-modelo_ativo = selecionar_modelo_pro()
 
 col_logo, col_titulo = st.columns([1, 5])
 with col_logo: st.markdown("# ⚡")
 with col_titulo:
-    st.title("Portal Auditor Eon (PRO)")
-    st.caption(f"Motor: {modelo_ativo} | Plano: Enterprise/Pago")
+    st.title("Portal Auditor Eon")
+    st.caption("Sistema Multi-Modelo (Auto-Recovery)")
 
 st.markdown("---")
 
-if 'dados_fatura' not in st.session_state: st.session_state['dados_fatura'] = None
 if 'etapa' not in st.session_state: st.session_state['etapa'] = 1
 if 'pdf_processado' not in st.session_state: st.session_state['pdf_processado'] = None
+if 'dados_fatura' not in st.session_state: st.session_state['dados_fatura'] = None
 
 container = st.container()
 
@@ -207,13 +162,12 @@ with container:
                         st.session_state['pdf_processado'] = pdf_desbloqueado
                         st.success("🔓 Sucesso!")
                         st.rerun()
-                    else:
-                        st.error("❌ Senha incorreta.")
+                    else: st.error("❌ Senha incorreta.")
                 st.stop()
             elif status == 'ok':
                 st.session_state['pdf_processado'] = pdf_final
             else:
-                st.error(f"Erro: {status}")
+                st.error("Erro no PDF.")
                 st.stop()
 
         if st.session_state['pdf_processado']:
@@ -223,16 +177,17 @@ with container:
 
             if st.session_state['etapa'] == 1:
                 if st.button("▶️ Ler Fatura", type="primary"):
-                    with st.status("Processando dados...", expanded=True) as status:
+                    with st.status("Tentando conexão com IA...", expanded=True) as status:
                         try:
-                            datas = extrair_datas(tmp_path, modelo_ativo)
+                            prompt_datas = 'Extraia as datas da conta (Leitura Anterior e Atual). JSON: { "inicio": "DD/MM", "fim": "DD/MM", "dias": "XX" }'
+                            datas = processar_inteligente(tmp_path, prompt_datas, "json")
                             st.session_state['dados_fatura'] = datas
                             st.session_state['etapa'] = 2
-                            status.update(label="✅ Leitura concluída!", state="complete", expanded=False)
+                            status.update(label="✅ Feito!", state="complete", expanded=False)
                             st.rerun()
                         except Exception as e:
-                            status.update(label="❌ Erro", state="error")
-                            st.error(str(e))
+                            status.update(label="❌ Erro Fatal", state="error")
+                            st.error(f"Erro: {e}")
 
             if st.session_state['etapa'] >= 2:
                 datas = st.session_state['dados_fatura'] or {}
@@ -244,34 +199,41 @@ with container:
                 geracao_input = c1.number_input("Geração (kWh):", min_value=0, step=10)
                 
                 if c2.button("🚀 Gerar Relatório", type="primary"):
-                    if geracao_input > 0:
-                        with st.spinner("O Auditor PRO está analisando..."):
-                            try:
-                                dados = analisar_performance_completa(tmp_path, modelo_ativo, geracao_input)
-                                
-                                st.markdown("---")
-                                st.subheader("🎯 Resultado Financeiro")
-                                
-                                met = dados.get("metricas", {})
-                                k1, k2, k3, k4 = st.columns(4)
-                                k1.metric("Atual", met.get("conta_atual", "-"))
-                                k2.metric("Sem Solar", met.get("sem_solar", "-"), delta="Evitado", delta_color="inverse")
-                                k3.metric("Economia", met.get("economia", "-"))
-                                k4.metric("ROI", met.get("pct", "-"))
+                    with st.spinner("Analisando (isso pode levar alguns segundos)..."):
+                        try:
+                            prompt_analise = f"""
+                            ATUE COMO: Auditor Técnico Sênior de Energia Solar.
+                            INPUTS: Fatura (PDF) e Geração Inversor ({geracao_input} kWh).
+                            
+                            DIRETRIZES TÉCNICAS:
+                            - Seja LITERAL com os dados da conta.
+                            - Autoconsumo = {geracao_input} - Energia Injetada.
+                            - Consumo Real = Consumo Rede + Autoconsumo.
 
-                                with st.expander("📄 Relatório Técnico", expanded=True):
-                                    st.markdown(dados.get("relatorio", ""))
-
-                                st.success("📲 WhatsApp:")
-                                st.code(dados.get("whatsapp", ""), language="text")
-                                
-                                if st.button("Nova Análise"):
-                                    st.session_state['etapa'] = 1
-                                    st.session_state['pdf_processado'] = None
-                                    st.rerun()
-                            except Exception as e:
-                                st.error(f"Erro: {e}")
-                    else:
-                        st.warning("Digite a geração.")
-    else:
-        st.session_state['pdf_processado'] = None
+                            SAÍDA JSON:
+                            {{
+                                "metricas": {{ "conta_atual": "R$", "sem_solar": "R$", "economia": "R$", "pct": "%" }},
+                                "relatorio": "Texto markdown.",
+                                "whatsapp": "Texto em tópicos."
+                            }}
+                            """
+                            dados = processar_inteligente(tmp_path, prompt_analise, "json")
+                            
+                            st.markdown("---")
+                            st.subheader("🎯 Resultado")
+                            met = dados.get("metricas", {})
+                            k1, k2, k3, k4 = st.columns(4)
+                            k1.metric("Atual", met.get("conta_atual", "-"))
+                            k2.metric("Sem Solar", met.get("sem_solar", "-"), delta="Evitado", delta_color="inverse")
+                            k3.metric("Economia", met.get("economia", "-"))
+                            k4.metric("ROI", met.get("pct", "-"))
+                            with st.expander("📄 Relatório Técnico", expanded=True):
+                                st.markdown(dados.get("relatorio", ""))
+                            st.success("📲 WhatsApp:")
+                            st.code(dados.get("whatsapp", ""), language="text")
+                            if st.button("Nova Análise"):
+                                st.session_state['etapa'] = 1
+                                st.session_state['pdf_processado'] = None
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
