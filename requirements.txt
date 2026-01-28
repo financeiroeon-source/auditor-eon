@@ -1,3 +1,2 @@
-streamlit>=1.30.0
-google-generativeai==0.8.3
-pypdf
+streamlit
+google-generativeai>=0.8.3
