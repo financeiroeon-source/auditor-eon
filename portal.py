@@ -88,50 +88,62 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
         st.error("Falha de autenticação na Huawei.")
         return 0.0
 
-    # 1. Gera lista de meses envolvidos (ex: 2025-12, 2026-01)
-    # A Huawei pede o tempo em milissegundos do primeiro dia do mês
-    meses_para_consultar = pd.date_range(data_inicio, data_fim, freq='MS').tolist()
-    # Adiciona o mês da data de início se ele não entrou na lista (caso data_inicio não seja dia 1)
-    if not meses_para_consultar or data_inicio.replace(day=1) < meses_para_consultar[0]:
-        meses_para_consultar.insert(0, data_inicio.replace(day=1))
+    # --- CORREÇÃO DO ERRO DE DATAS ---
+    # Convertemos tudo para Pandas Timestamp para evitar o TypeError na comparação
+    ts_inicio = pd.Timestamp(data_inicio)
+    ts_fim = pd.Timestamp(data_fim)
+
+    # 1. Gera lista de meses (usando os Timestamps)
+    meses_para_consultar = pd.date_range(ts_inicio, ts_fim, freq='MS').tolist()
+    
+    # Adiciona o mês da data de início se ele não entrou na lista
+    # Agora comparamos Timestamp com Timestamp (compatíveis)
+    if not meses_para_consultar or ts_inicio.replace(day=1) < meses_para_consultar[0]:
+        meses_para_consultar.insert(0, ts_inicio.replace(day=1))
     
     headers = {"xsrf-token": token}
     
-    with st.spinner(f"Consultando dados detalhados da Huawei..."):
-        for mes_obj in meses_para_consultar:
-            # Timestamp em milissegundos do dia 1 do mês
-            collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
+    # Barra de progresso para dar feedback visual (opcional, mas legal)
+    progresso_texto = st.empty()
+
+    for mes_obj in meses_para_consultar:
+        progresso_texto.text(f"Consultando Huawei: Mês {mes_obj.month}/{mes_obj.year}...")
+        
+        # Timestamp em milissegundos do dia 1 do mês
+        collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
+        
+        payload = {
+            "stationCodes": station_code,
+            "collectTime": collect_time
+        }
+        
+        try:
+            # getKpiStationMonth retorna os DADOS DIÁRIOS daquele mês
+            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=15)
+            dados = r.json().get("data", [])
             
-            payload = {
-                "stationCodes": station_code,
-                "collectTime": collect_time
-            }
+            # A resposta vem como uma lista de dias
+            if isinstance(dados, list):
+                for dia_kpi in dados:
+                    mapa = dia_kpi.get("dataItemMap", {})
+                    
+                    # Extrai a produção do dia
+                    producao = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
+                    
+                    # A Huawei retorna o "collectTime" do dia.
+                    tempo_ms = dia_kpi.get("collectTime", 0)
+                    if tempo_ms > 0:
+                        # Convertemos para date simples para comparar com o input do usuário
+                        data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
+                        
+                        # O PULO DO GATO: Só soma se estiver dentro do período escolhido
+                        # Como data_inicio e data_fim são date, e data_registro é date, aqui funciona!
+                        if data_inicio <= data_registro <= data_fim:
+                            total_energia += producao
+        except Exception as e:
+            print(f"Erro mês {mes_obj}: {e}")
             
-            try:
-                # getKpiStationMonth retorna os DADOS DIÁRIOS daquele mês
-                r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=15)
-                dados = r.json().get("data", [])
-                
-                # A resposta vem como uma lista de dias
-                if isinstance(dados, list):
-                    for dia_kpi in dados:
-                        # O dado pode vir em estruturas diferentes, tentamos garantir
-                        mapa = dia_kpi.get("dataItemMap", {})
-                        
-                        # Extrai a produção do dia
-                        producao = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
-                        
-                        # A Huawei retorna o "collectTime" do dia. Precisamos ver se esse dia está no range.
-                        tempo_ms = dia_kpi.get("collectTime", 0)
-                        if tempo_ms > 0:
-                            data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                            
-                            # O PULO DO GATO: Só soma se estiver dentro do período escolhido
-                            if data_inicio <= data_registro <= data_fim:
-                                total_energia += producao
-            except Exception as e:
-                print(f"Erro mês {mes_obj}: {e}")
-                
+    progresso_texto.empty() # Limpa o texto de carregamento
     return total_energia
 
 # --- FUNÇÃO DE LISTAGEM (Para o Dropdown) ---
