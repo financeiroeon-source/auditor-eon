@@ -201,12 +201,15 @@ elif menu == "📄 Auditoria de Conta":
             if st.button("🚀 Calcular Geração Real"):
                 with st.spinner(f"Consultando {usina_vinculada['marca']}..."):
                     geracao = 0.0
+                    
+                    # --- SOLIS ---
                     if usina_vinculada["marca"] == "Solis":
                         geracao = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
+                    
+                    # --- HUAWEI (AGORA DESTRAVADO) ---
                     elif usina_vinculada["marca"] == "Huawei":
-                        # Simulação Huawei (avisando usuario)
-                        st.info("ℹ️ Huawei: Consulta de período exato em desenvolvimento. Mostrando estimativa.")
-                        geracao = 0.0 
+                        # Chama a função nova V2.0 que você já colou lá em cima
+                        geracao = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
                     st.metric(label="Geração no Período", value=f"{geracao:.2f} kWh")
                     
@@ -214,8 +217,14 @@ elif menu == "📄 Auditoria de Conta":
                     fatura = st.number_input("Quanto a concessionária creditou? (kWh)", value=0.0)
                     if fatura > 0:
                         diff = fatura - geracao
-                        if diff < 0: st.error(f"⚠️ A concessionária comeu {abs(diff):.2f} kWh!")
-                        else: st.success(f"✅ Tudo certo! Diferença de {diff:.2f} kWh (aceitável).")
+                        st.divider()
+                        if diff < -5: # Margem de erro de 5 kWh
+                            st.error(f"⚠️ A concessionária comeu {abs(diff):.2f} kWh!")
+                            st.write(f"Era para ter: **{geracao:.2f}** | Veio: **{fatura:.2f}**")
+                        elif diff > 5:
+                            st.warning(f"🤔 Estranho... A concessionária creditou {diff:.2f} kWh A MAIS.")
+                        else:
+                            st.success(f"✅ Tudo certo! Diferença de {diff:.2f} kWh (dentro da margem técnica).")
 
 elif menu == "⚙️ Configurações":
     st.json(carregar_clientes())
