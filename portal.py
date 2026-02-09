@@ -150,26 +150,51 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     progresso.empty()
     return total_energia
 
-# --- FUNÇÃO DE LISTAGEM ---
+# --- FUNÇÃO DE LISTAGEM (CORRIGIDA) ---
 @st.cache_data(ttl=600)
 def listar_todas_usinas():
     lista = []
-    # Huawei
-    token = get_huawei_token()
-    if token:
-        try:
-            r = requests.post(f"{CREDS['huawei']['url']}/getStationList", json={"pageNo": 1, "pageSize": 100}, headers={"xsrf-token": token})
-            for s in r.json().get("data", []):
-                lista.append({"id": str(s["stationCode"]), "nome": s["stationName"], "marca": "Huawei", "display": f"Huawei | {s['stationName']}"})
-        except: pass
-    # Solis
+    
+    # --- HUAWEI ---
+    try:
+        token = get_huawei_token()
+        if token:
+            r = requests.post(f"{CREDS['huawei']['url']}/getStationList", json={"pageNo": 1, "pageSize": 100}, headers={"xsrf-token": token}, timeout=10)
+            resposta = r.json()
+            # Correção: Verifica se 'data' é uma lista direta ou se tem uma chave 'list' dentro
+            dados_brutos = resposta.get("data", [])
+            if isinstance(dados_brutos, list):
+                estacoes_huawei = dados_brutos
+            else:
+                estacoes_huawei = dados_brutos.get("list", [])
+                
+            for s in estacoes_huawei:
+                lista.append({
+                    "id": str(s.get("stationCode")), 
+                    "nome": s.get("stationName"), 
+                    "marca": "Huawei", 
+                    "display": f"Huawei | {s.get('stationName')}"
+                })
+    except Exception as e:
+        print(f"Erro ao listar Huawei: {e}")
+
+    # --- SOLIS ---
     try:
         body = json.dumps({"pageNo": 1, "pageSize": 100})
         headers = get_solis_auth("/v1/api/userStationList", body)
-        r = requests.post(f"{CREDS['solis']['url']}/v1/api/userStationList", data=body, headers=headers)
-        for s in r.json().get("data", {}).get("page", {}).get("records", []):
-            lista.append({"id": str(s["id"]), "nome": s["stationName"], "marca": "Solis", "display": f"Solis | {s['stationName']}"})
-    except: pass
+        r = requests.post(f"{CREDS['solis']['url']}/v1/api/userStationList", data=body, headers=headers, timeout=10)
+        # Solis também pode variar, garantindo acesso seguro
+        dados_solis = r.json().get("data", {}).get("page", {}).get("records", [])
+        for s in dados_solis:
+            lista.append({
+                "id": str(s.get("id")), 
+                "nome": s.get("stationName"), 
+                "marca": "Solis", 
+                "display": f"Solis | {s.get('stationName')}"
+            })
+    except Exception as e:
+        print(f"Erro ao listar Solis: {e}")
+        
     return lista
 
 # --- INTERFACE ---
