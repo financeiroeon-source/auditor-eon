@@ -132,7 +132,7 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
             if isinstance(dados, list):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
-                    producao = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
+                    producao = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or 0)
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
@@ -244,6 +244,12 @@ elif menu == "📄 Auditoria de Conta":
                         
                         # 4. Plota o gráfico preenchido
                         st.bar_chart(df_completo, color="#FFA500") 
+                        # ... código do gráfico acima ...
+                        st.bar_chart(df_completo, color="#FFA500") 
+                        
+                        # NOVO: Botão para ver os dados brutos
+                        with st.expander("🔎 Ver Tabela Detalhada (Dia a Dia)"):
+                            st.dataframe(df_completo.style.format("{:.2f} kWh"))
                     
                     if fatura > 0:
                         diff = fatura - total
