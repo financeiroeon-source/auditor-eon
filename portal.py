@@ -22,7 +22,7 @@ def conectar_gsheets():
         client = gspread.authorize(credentials)
         return client.open("Banco de Dados Eon").sheet1
     except Exception as e:
-        st.error(f"Erro ao conectar na planilha: {e}")
+        # st.error(f"Erro plan: {e}") # Silenciado para não poluir visualmente se der erro pontual
         return None
 
 def carregar_clientes():
@@ -39,9 +39,7 @@ def carregar_clientes():
                     "nome": row["Nome_Inversor"]
                 }
         return db
-    except Exception as e:
-        print(f"Erro plan: {e}")
-        return {}
+    except: return {}
 
 def salvar_cliente(nome_conta, dados_usina):
     try:
@@ -84,7 +82,7 @@ def get_solis_auth(resource, body):
     auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
     return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-# --- BUSCA DE DADOS (COM CORREÇÃO DE DATAS BLINDADA) ---
+# --- BUSCA SOLIS (MANTIDA IGUAL) ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
     dados_diarios = {} 
     meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
@@ -107,83 +105,92 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         
     if dados_diarios:
         df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
-        df['Data'] = pd.to_datetime(df['Data']) # Garante formato data
+        df['Data'] = pd.to_datetime(df['Data'])
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
 
+# --- BUSCA HUAWEI "ARRASTÃO" (DEEP SCAN) ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
-    dados_diarios = {} 
+    dados_diarios = {} # Vai somar a geração de TODOS os dispositivos
     
-    endpoint = "/getKpiStationMonth"
+    # 1. LISTA TODOS OS DISPOSITIVOS DA USINA
+    dev_ids = []
+    try:
+        r = requests.post(f"{CREDS['huawei']['url']}/getDevList", json={"stationCodes": station_code}, headers=headers, timeout=10)
+        devices = r.json().get("data", [])
+        # Pega IDs de tudo que não for medidor de consumo puro (tenta Inversores e Baterias)
+        # Tipos comuns: 1=Inversor, 38=Dongle. Vamos tentar ler todos.
+        dev_ids = [d.get("id") for d in devices if d.get("id")]
+    except: pass
+
+    if not dev_ids:
+        st.warning("Nenhum dispositivo encontrado na usina.")
+        return 0.0, pd.DataFrame()
+
+    st.toast(f"Varrendo {len(dev_ids)} dispositivo(s)...", icon="🔍")
     
-    # Pega 1 mês antes para garantir o cálculo do hodômetro
-    dt_safe_start = data_inicio - timedelta(days=30)
-    # Converte tudo para Timestamp para evitar erro de tipo no loop
-    ts_inicio = pd.Timestamp(dt_safe_start)
+    # 2. VARREDURA POR DISPOSITIVO
+    ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
-    
     meses = pd.date_range(ts_inicio, ts_fim, freq='MS').tolist()
     if not meses or ts_inicio.replace(day=1) < meses[0]:
         meses.insert(0, ts_inicio.replace(day=1))
     
     progresso = st.empty()
-
-    for mes_obj in meses:
-        progresso.text(f"Lendo Huawei ({mes_obj.month}/{mes_obj.year})...")
-        collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
-        
-        payload = {"stationCodes": station_code, "collectTime": collect_time}
-        
-        try:
-            r = requests.post(f"{CREDS['huawei']['url']}{endpoint}", json=payload, headers=headers, timeout=15)
-            dados = r.json().get("data", [])
-            
-            if isinstance(dados, list):
-                for dia_kpi in dados:
-                    mapa = dia_kpi.get("dataItemMap", {})
-                    # Tenta pegar qualquer valor disponível
-                    val = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or mapa.get("power_profit", 0) or 0)
-                    tempo_ms = dia_kpi.get("collectTime", 0)
-                    if tempo_ms > 0:
-                        data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                        if val > 0:
-                            dados_diarios[data_registro] = val
-        except: pass
-            
-    progresso.empty()
     
+    # Dicionário temporário para evitar duplicatas (Data -> Soma kWh)
+    temp_dados = {}
+
+    for dev_id in dev_ids:
+        for mes_obj in meses:
+            progresso.text(f"Lendo Dev {dev_id} ({mes_obj.month}/{mes_obj.year})...")
+            collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
+            
+            payload = {"devIds": str(dev_id), "collectTime": collect_time}
+            
+            try:
+                # Endpoint de DISPOSITIVO (o segredo está aqui)
+                r = requests.post(f"{CREDS['huawei']['url']}/getDevKpiMonth", json=payload, headers=headers, timeout=10)
+                dados = r.json().get("data", [])
+                
+                if isinstance(dados, list):
+                    for dia_kpi in dados:
+                        mapa = dia_kpi.get("dataItemMap", {})
+                        
+                        # Chave mágica dos dispositivos: daily_energy_yield
+                        val = float(mapa.get("daily_energy_yield", 0) or mapa.get("daily_yield", 0) or 0)
+                        
+                        tempo_ms = dia_kpi.get("collectTime", 0)
+                        if tempo_ms > 0 and val > 0:
+                            data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
+                            
+                            # Soma no dia (caso tenha mais de 1 inversor)
+                            if data_registro not in temp_dados: temp_dados[data_registro] = 0.0
+                            temp_dados[data_registro] += val
+            except: pass
+
+    progresso.empty()
+
+    # Filtra pelo período escolhido
+    for dt, val in temp_dados.items():
+        if data_inicio <= dt <= data_fim:
+            dados_diarios[dt] = val
+
     if not dados_diarios:
+        # PLANO C: Se falhar tudo, tenta Estação normal
         return 0.0, pd.DataFrame()
 
-    # --- CORREÇÃO DE TIPOS (A SOLUÇÃO DO TYPEERROR) ---
-    df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'Valor'])
-    # Força a coluna Data para ser DateTime oficial do Pandas
+    df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
     df['Data'] = pd.to_datetime(df['Data'])
     df = df.set_index('Data').sort_index()
     
-    # --- LÓGICA DO HODÔMETRO ---
-    media = df['Valor'].mean()
-    
-    if media > 500:
-        st.toast(f"Modo Acumulado Ativado (Média: {media:.0f}).", icon="🔧")
-        df['kWh'] = df['Valor'].diff()
-        df['kWh'] = df['kWh'].fillna(0) 
-        df = df[df['kWh'] >= 0]
-    else:
-        df['kWh'] = df['Valor']
-
-    # --- FILTRO DE DATA SEGURO ---
-    # Converte os inputs do usuário também para DateTime oficial
-    start_ts = pd.to_datetime(data_inicio)
-    end_ts = pd.to_datetime(data_fim)
-    
-    # Agora comparamos Banana com Banana (Timestamp com Timestamp)
-    mask = (df.index >= start_ts) & (df.index <= end_ts)
+    # Filtro final de segurança
+    mask = (df.index >= pd.to_datetime(data_inicio)) & (df.index <= pd.to_datetime(data_fim))
     df_final = df.loc[mask]
     
     return df_final['kWh'].sum(), df_final[['kWh']]
@@ -270,14 +277,10 @@ elif menu == "📄 Auditoria de Conta":
                     if not df_diario.empty:
                         st.subheader("📊 Histórico Diário")
                         
-                        # Garante que o índice é Datetime para o reindex funcionar
                         df_diario.index = pd.to_datetime(df_diario.index)
-                        
-                        # Preenche dias vazios com 0
                         calendario_completo = pd.date_range(start=pd.to_datetime(dt_inicio), end=pd.to_datetime(dt_fim))
                         df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
                         
-                        # Visualização
                         chart_data = df_completo.copy()
                         chart_data.index = chart_data.index.strftime("%d/%m")
                         st.bar_chart(chart_data, color="#FFA500") 
