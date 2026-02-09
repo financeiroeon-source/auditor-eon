@@ -222,14 +222,28 @@ elif menu == "📄 Auditoria de Conta":
                     elif usina_vinculada["marca"] == "Huawei":
                         total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
-                    # MOSTRA OS RESULTADOS
+                    # --- MOSTRA OS RESULTADOS ---
                     col_metrica, col_fatura = st.columns(2)
                     col_metrica.metric("Geração Total (Inversor)", f"{total:.2f} kWh")
                     
                     fatura = col_fatura.number_input("Crédito na Fatura (kWh)", value=0.0)
                     
                     if not df_diario.empty:
-                        st.bar_chart(df_diario, color="#FFA500") # Gráfico Laranja Solar
+                        st.subheader("📊 Histórico Diário")
+                        
+                        # --- CORREÇÃO VISUAL DO GRÁFICO ---
+                        # 1. Garante que o índice é datetime
+                        df_diario.index = pd.to_datetime(df_diario.index)
+                        
+                        # 2. Cria um calendário completo do início ao fim (preenche buracos com 0)
+                        calendario_completo = pd.date_range(start=dt_inicio, end=dt_fim)
+                        df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
+                        
+                        # 3. Formata a data para ficar bonitinha no eixo X (Dia/Mês)
+                        df_completo.index = df_completo.index.strftime("%d/%m")
+                        
+                        # 4. Plota o gráfico preenchido
+                        st.bar_chart(df_completo, color="#FFA500") 
                     
                     if fatura > 0:
                         diff = fatura - total
