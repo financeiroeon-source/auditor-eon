@@ -122,6 +122,10 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     dados_diarios = {}
     progresso = st.empty()
 
+    # ÁREA DE DIAGNÓSTICO
+    st.markdown("### 🕵️ Área de Investigação (Debug)")
+    debug_feito = False
+
     for mes_obj in meses_para_consultar:
         progresso.text(f"Consultando Huawei: Mês {mes_obj.month}/{mes_obj.year}...")
         collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
@@ -132,12 +136,27 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
             if isinstance(dados, list):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
+                    
+                    # TENTA PEGAR O VALOR (Seja qual for o nome)
+                    # Ordem de tentativa: product_power -> inverter_power -> power_profit
                     producao = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or 0)
+                    
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                        if data_inicio <= data_registro <= data_fim:
-                            dados_diarios[data_registro] = producao
+                        
+                        # DIAGNÓSTICO: Se o valor for absurdo (> 500 kWh), mostra os dados brutos para a gente ver
+                        if producao > 500 and not debug_feito:
+                            with st.expander(f"⚠️ ALERTA: Valor gigante detectado em {data_registro}!", expanded=True):
+                                st.write(f"O sistema leu: **{producao} kWh** (Improvável).")
+                                st.write("Confira abaixo qual desses campos parece ser a produção real do dia (ex: 30-60 kWh):")
+                                st.json(mapa) # ISSO VAI MOSTRAR TODOS OS CAMPOS
+                            debug_feito = True # Só mostra 1 vez para não poluir
+
+                        # TRAVA DE SEGURANÇA: Se for > 1000 kWh, ignoramos para não estragar o gráfico
+                        if producao < 1000:
+                            if data_inicio <= data_registro <= data_fim:
+                                dados_diarios[data_registro] = producao
         except: pass
             
     progresso.empty()
@@ -147,7 +166,6 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
-
 # --- FUNÇÃO LISTAGEM (MANTIDA IGUAL) ---
 @st.cache_data(ttl=600)
 def listar_todas_usinas():
