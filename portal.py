@@ -16,14 +16,19 @@ st.set_page_config(page_title="Portal Eon Solar", page_icon="☀️", layout="wi
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 def conectar_gsheets():
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    client = gspread.authorize(credentials)
-    return client.open("Banco de Dados Eon").sheet1
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(credentials)
+        return client.open("Banco de Dados Eon").sheet1
+    except Exception as e:
+        st.error(f"Erro ao conectar na planilha: {e}")
+        return None
 
 def carregar_clientes():
     try:
         sheet = conectar_gsheets()
+        if not sheet: return {}
         rows = sheet.get_all_records()
         db = {}
         for row in rows:
@@ -41,6 +46,7 @@ def carregar_clientes():
 def salvar_cliente(nome_conta, dados_usina):
     try:
         sheet = conectar_gsheets()
+        if not sheet: return False
         sheet.append_row([nome_conta, str(dados_usina["id"]), dados_usina["marca"], dados_usina["nome"]])
         return True
     except Exception as e:
@@ -78,7 +84,7 @@ def get_solis_auth(resource, body):
     auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
     return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-# --- BUSCA DE DADOS (COM CORREÇÃO DE DATAS E HODÔMETRO) ---
+# --- BUSCA DE DADOS (COM CORREÇÃO DE DATAS BLINDADA) ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
     dados_diarios = {} 
     meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
@@ -101,7 +107,7 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         
     if dados_diarios:
         df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
-        df['Data'] = pd.to_datetime(df['Data']) # Garante formato correto
+        df['Data'] = pd.to_datetime(df['Data']) # Garante formato data
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
@@ -111,12 +117,13 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
-    dados_diarios = {} # Vai guardar Data -> Valor Bruto
+    dados_diarios = {} 
     
     endpoint = "/getKpiStationMonth"
     
-    # Busca dados com 1 mês de margem para o cálculo do hodômetro
+    # Pega 1 mês antes para garantir o cálculo do hodômetro
     dt_safe_start = data_inicio - timedelta(days=30)
+    # Converte tudo para Timestamp para evitar erro de tipo no loop
     ts_inicio = pd.Timestamp(dt_safe_start)
     ts_fim = pd.Timestamp(data_fim)
     
@@ -139,10 +146,8 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
             if isinstance(dados, list):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
-                    
-                    # Pega qualquer valor disponível
+                    # Tenta pegar qualquer valor disponível
                     val = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or mapa.get("power_profit", 0) or 0)
-                    
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
@@ -155,9 +160,9 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     if not dados_diarios:
         return 0.0, pd.DataFrame()
 
-    # --- CORREÇÃO DE TIPO (CRUCIAL) ---
+    # --- CORREÇÃO DE TIPOS (A SOLUÇÃO DO TYPEERROR) ---
     df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'Valor'])
-    # Converte explicitamente para DatetimeIndex para evitar TypeError na comparação
+    # Força a coluna Data para ser DateTime oficial do Pandas
     df['Data'] = pd.to_datetime(df['Data'])
     df = df.set_index('Data').sort_index()
     
@@ -166,17 +171,19 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     
     if media > 500:
         st.toast(f"Modo Acumulado Ativado (Média: {media:.0f}).", icon="🔧")
-        # Diferença entre hoje e ontem
         df['kWh'] = df['Valor'].diff()
-        df['kWh'] = df['kWh'].fillna(0) # Trata o primeiro dia
-        # Remove dias negativos (erros de reset) ou zeros espúrios se necessário
+        df['kWh'] = df['kWh'].fillna(0) 
         df = df[df['kWh'] >= 0]
     else:
         df['kWh'] = df['Valor']
 
-    # --- FILTRO DE DATA BLINDADO ---
-    # Agora df.index é DatetimeIndex e pd.Timestamp funciona perfeitamente
-    mask = (df.index >= pd.Timestamp(data_inicio)) & (df.index <= pd.Timestamp(data_fim))
+    # --- FILTRO DE DATA SEGURO ---
+    # Converte os inputs do usuário também para DateTime oficial
+    start_ts = pd.to_datetime(data_inicio)
+    end_ts = pd.to_datetime(data_fim)
+    
+    # Agora comparamos Banana com Banana (Timestamp com Timestamp)
+    mask = (df.index >= start_ts) & (df.index <= end_ts)
     df_final = df.loc[mask]
     
     return df_final['kWh'].sum(), df_final[['kWh']]
@@ -263,16 +270,14 @@ elif menu == "📄 Auditoria de Conta":
                     if not df_diario.empty:
                         st.subheader("📊 Histórico Diário")
                         
-                        # Normalização Visual
-                        # Converte índice para datetime caso ainda não esteja (segurança extra)
+                        # Garante que o índice é Datetime para o reindex funcionar
                         df_diario.index = pd.to_datetime(df_diario.index)
                         
-                        # Garante preenchimento de datas vazias
-                        # Convertemos dt_inicio e dt_fim para timestamp para o date_range funcionar bem
-                        calendario_completo = pd.date_range(start=pd.Timestamp(dt_inicio), end=pd.Timestamp(dt_fim))
+                        # Preenche dias vazios com 0
+                        calendario_completo = pd.date_range(start=pd.to_datetime(dt_inicio), end=pd.to_datetime(dt_fim))
                         df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
                         
-                        # Exibição
+                        # Visualização
                         chart_data = df_completo.copy()
                         chart_data.index = chart_data.index.strftime("%d/%m")
                         st.bar_chart(chart_data, color="#FFA500") 
@@ -288,4 +293,10 @@ elif menu == "📄 Auditoria de Conta":
                         elif diff > 5:
                             st.warning(f"⚠️ DIVERGÊNCIA: Creditou a mais (+{diff:.2f} kWh)")
                         else:
-                            st.success(f"✅ CONTA BATIDA (Difer
+                            st.success(f"✅ CONTA BATIDA (Diferença: {diff:.2f} kWh)")
+
+elif menu == "⚙️ Configurações":
+    st.info("Banco de Dados conectado ao Google Sheets.")
+    if st.button("Forçar Recarregamento"):
+        st.cache_data.clear()
+        st.rerun()
