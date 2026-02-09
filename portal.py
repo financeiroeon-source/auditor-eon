@@ -78,7 +78,7 @@ def get_solis_auth(resource, body):
     auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
     return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-# --- BUSCA DE DADOS (COM CORREÇÃO MATEMÁTICA) ---
+# --- BUSCA DE DADOS (COM CORREÇÃO DE DATAS E HODÔMETRO) ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
     dados_diarios = {} 
     meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
@@ -101,6 +101,7 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         
     if dados_diarios:
         df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
+        df['Data'] = pd.to_datetime(df['Data']) # Garante formato correto
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
@@ -112,10 +113,9 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     headers = {"xsrf-token": token}
     dados_diarios = {} # Vai guardar Data -> Valor Bruto
     
-    # Voltamos ao modo ESTAÇÃO (getKpiStationMonth) que sabemos que conecta
     endpoint = "/getKpiStationMonth"
     
-    # DICA: Pedimos um mês ANTES também para ter base de comparação se precisar subtrair
+    # Busca dados com 1 mês de margem para o cálculo do hodômetro
     dt_safe_start = data_inicio - timedelta(days=30)
     ts_inicio = pd.Timestamp(dt_safe_start)
     ts_fim = pd.Timestamp(data_fim)
@@ -140,14 +140,12 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
                     
-                    # Tenta pegar qualquer valor que exista
-                    # Prioridade: product_power (geralmente diário) -> inverter_power (as vezes acumulado)
+                    # Pega qualquer valor disponível
                     val = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or mapa.get("power_profit", 0) or 0)
                     
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                        # Guardamos tudo, depois filtramos
                         if val > 0:
                             dados_diarios[data_registro] = val
         except: pass
@@ -157,32 +155,33 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     if not dados_diarios:
         return 0.0, pd.DataFrame()
 
-    # --- A MÁGICA DA CORREÇÃO (HODÔMETRO) ---
+    # --- CORREÇÃO DE TIPO (CRUCIAL) ---
     df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'Valor'])
+    # Converte explicitamente para DatetimeIndex para evitar TypeError na comparação
+    df['Data'] = pd.to_datetime(df['Data'])
     df = df.set_index('Data').sort_index()
     
-    # Verifica a média dos valores. Se for > 500, é ACUMULADO (Hodômetro).
+    # --- LÓGICA DO HODÔMETRO ---
     media = df['Valor'].mean()
     
     if media > 500:
-        st.toast(f"Detectado padrão Acumulado (Média: {media:.0f}). Aplicando correção...", icon="🔧")
-        # Calcula a diferença dia a dia (Hoje - Ontem)
+        st.toast(f"Modo Acumulado Ativado (Média: {media:.0f}).", icon="🔧")
+        # Diferença entre hoje e ontem
         df['kWh'] = df['Valor'].diff()
-        # O primeiro dia vai ficar NaN (vazio) ou errado, tratamos:
-        df['kWh'] = df['kWh'].fillna(0)
-        # Remove dias com valores negativos (erros de reset do inversor)
+        df['kWh'] = df['kWh'].fillna(0) # Trata o primeiro dia
+        # Remove dias negativos (erros de reset) ou zeros espúrios se necessário
         df = df[df['kWh'] >= 0]
     else:
-        # Se for valor normal, usa direto
         df['kWh'] = df['Valor']
 
-    # Filtra apenas o período que o usuário pediu
+    # --- FILTRO DE DATA BLINDADO ---
+    # Agora df.index é DatetimeIndex e pd.Timestamp funciona perfeitamente
     mask = (df.index >= pd.Timestamp(data_inicio)) & (df.index <= pd.Timestamp(data_fim))
     df_final = df.loc[mask]
     
     return df_final['kWh'].sum(), df_final[['kWh']]
 
-# --- FUNÇÃO LISTAGEM (MANTIDA) ---
+# --- FUNÇÃO LISTAGEM ---
 @st.cache_data(ttl=600)
 def listar_todas_usinas():
     lista = []
@@ -265,18 +264,19 @@ elif menu == "📄 Auditoria de Conta":
                         st.subheader("📊 Histórico Diário")
                         
                         # Normalização Visual
+                        # Converte índice para datetime caso ainda não esteja (segurança extra)
                         df_diario.index = pd.to_datetime(df_diario.index)
-                        calendario_completo = pd.date_range(start=dt_inicio, end=dt_fim)
-                        # Preenche dias vazios com 0
+                        
+                        # Garante preenchimento de datas vazias
+                        # Convertemos dt_inicio e dt_fim para timestamp para o date_range funcionar bem
+                        calendario_completo = pd.date_range(start=pd.Timestamp(dt_inicio), end=pd.Timestamp(dt_fim))
                         df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
                         
-                        # Mostra gráfico
-                        # Cria uma cópia para formatar a data string só na visualização
+                        # Exibição
                         chart_data = df_completo.copy()
                         chart_data.index = chart_data.index.strftime("%d/%m")
                         st.bar_chart(chart_data, color="#FFA500") 
                         
-                        # Tabela
                         with st.expander("🔎 Ver Tabela Detalhada"):
                             st.dataframe(df_completo.style.format("{:.2f} kWh"))
                     
@@ -288,10 +288,4 @@ elif menu == "📄 Auditoria de Conta":
                         elif diff > 5:
                             st.warning(f"⚠️ DIVERGÊNCIA: Creditou a mais (+{diff:.2f} kWh)")
                         else:
-                            st.success(f"✅ CONTA BATIDA (Diferença: {diff:.2f} kWh)")
-
-elif menu == "⚙️ Configurações":
-    st.info("Banco de Dados conectado ao Google Sheets.")
-    if st.button("Forçar Recarregamento"):
-        st.cache_data.clear()
-        st.rerun()
+                            st.success(f"✅ CONTA BATIDA (Difer
