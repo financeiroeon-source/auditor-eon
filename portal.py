@@ -61,7 +61,7 @@ CREDS = {
     }
 }
 
-# --- AUTH APIS ---
+# --- FUNÇÕES DE AUTENTICAÇÃO ---
 def get_huawei_token():
     try:
         r = requests.post(f"{CREDS['huawei']['url']}/login", json={"userName": CREDS['huawei']['user'], "systemCode": CREDS['huawei']['pass']}, timeout=10)
@@ -78,10 +78,25 @@ def get_solis_auth(resource, body):
     auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
     return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-# --- FUNÇÕES DE BUSCA (RETORNANDO DADOS PARA GRÁFICO) ---
+# --- FUNÇÃO NOVA: DESCOBRIR ID DO INVERSOR ---
+def get_inverter_id(station_code, token):
+    """Entra na usina e descobre qual é o ID do aparelho Inversor real"""
+    try:
+        headers = {"xsrf-token": token}
+        r = requests.post(f"{CREDS['huawei']['url']}/getDevList", json={"stationCodes": station_code}, headers=headers, timeout=10)
+        devices = r.json().get("data", [])
+        
+        # Procura pelo dispositivo tipo '1' (Inversor)
+        for dev in devices:
+            if dev.get("devTypeId") == 1:
+                return dev.get("id")
+    except Exception as e:
+        print(f"Erro ao buscar dispositivos: {e}")
+    return None
+
+# --- FUNÇÕES DE BUSCA (MOTOR DA AUDITORIA) ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
-    dados_diarios = {} # Dicionario data: valor
-    
+    dados_diarios = {} 
     meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
     if data_inicio.strftime("%Y-%m") not in meses: meses.append(data_inicio.strftime("%Y-%m"))
     
@@ -95,13 +110,11 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
                 dia_str = rec.get("date", "")
                 if len(dia_str) < 3: full_date = f"{mes}-{int(dia_str):02d}"
                 else: full_date = dia_str
-                
                 data_obj = datetime.strptime(full_date, "%Y-%m-%d").date()
                 if data_inicio <= data_obj <= data_fim:
                     dados_diarios[data_obj] = float(rec.get("energy", 0))
         except: pass
         
-    # Cria DataFrame para o gráfico
     if dados_diarios:
         df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
         df = df.set_index('Data').sort_index()
@@ -111,53 +124,65 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
-
-    ts_inicio = pd.Timestamp(data_inicio)
-    ts_fim = pd.Timestamp(data_fim)
-    meses_para_consultar = pd.date_range(ts_inicio, ts_fim, freq='MS').tolist()
-    if not meses_para_consultar or ts_inicio.replace(day=1) < meses_para_consultar[0]:
-        meses_para_consultar.insert(0, ts_inicio.replace(day=1))
     
     headers = {"xsrf-token": token}
     dados_diarios = {}
+    
+    # 1. MODO DISPOSITIVO: Tenta achar o inversor real
+    dev_id = get_inverter_id(station_code, token)
+    
+    # Se achou inversor, usa endpoint de dispositivo. Se não, usa o de estação.
+    endpoint = "/getDevKpiMonth" if dev_id else "/getKpiStationMonth"
+    payload_id_key = "devIds" if dev_id else "stationCodes"
+    target_id = str(dev_id) if dev_id else station_code
+    
+    # Aviso visual discreto
+    if dev_id:
+        st.toast(f"Consultando Inversor ID: {dev_id}", icon="📟")
+    else:
+        st.toast("Consultando Estação Geral", icon="🏠")
+
+    ts_inicio = pd.Timestamp(data_inicio)
+    ts_fim = pd.Timestamp(data_fim)
+    
+    meses = pd.date_range(ts_inicio, ts_fim, freq='MS').tolist()
+    if not meses or ts_inicio.replace(day=1) < meses[0]:
+        meses.insert(0, ts_inicio.replace(day=1))
+    
     progresso = st.empty()
 
-    # ÁREA DE DIAGNÓSTICO
-    st.markdown("### 🕵️ Área de Investigação (Debug)")
-    debug_feito = False
-
-    for mes_obj in meses_para_consultar:
-        progresso.text(f"Consultando Huawei: Mês {mes_obj.month}/{mes_obj.year}...")
+    for mes_obj in meses:
+        progresso.text(f"Lendo Huawei ({mes_obj.month}/{mes_obj.year})...")
         collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
-        payload = {"stationCodes": station_code, "collectTime": collect_time}
+        
+        payload = {payload_id_key: target_id, "collectTime": collect_time}
+        
         try:
-            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=15)
+            r = requests.post(f"{CREDS['huawei']['url']}{endpoint}", json=payload, headers=headers, timeout=15)
             dados = r.json().get("data", [])
+            
             if isinstance(dados, list):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
                     
-                    # TENTA PEGAR O VALOR (Seja qual for o nome)
-                    # Ordem de tentativa: product_power -> inverter_power -> power_profit
-                    producao = float(mapa.get("product_power", 0) or mapa.get("inverter_power", 0) or 0)
+                    # PROCURA PELO CAMPO CORRETO (Prioridade para 'daily_energy_yield')
+                    possible_keys = ["daily_energy_yield", "product_power", "active_power", "inverter_power"]
+                    
+                    producao = 0.0
+                    for k in possible_keys:
+                        val = float(mapa.get(k, 0) or 0)
+                        # Filtro: Ignora valores gigantes (acumulados) ou negativos
+                        if 0 < val < 800: 
+                            producao = val
+                            break
                     
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                        
-                        # DIAGNÓSTICO: Se o valor for absurdo (> 500 kWh), mostra os dados brutos para a gente ver
-                        if producao > 500 and not debug_feito:
-                            with st.expander(f"⚠️ ALERTA: Valor gigante detectado em {data_registro}!", expanded=True):
-                                st.write(f"O sistema leu: **{producao} kWh** (Improvável).")
-                                st.write("Confira abaixo qual desses campos parece ser a produção real do dia (ex: 30-60 kWh):")
-                                st.json(mapa) # ISSO VAI MOSTRAR TODOS OS CAMPOS
-                            debug_feito = True # Só mostra 1 vez para não poluir
-
-                        # TRAVA DE SEGURANÇA: Se for > 1000 kWh, ignoramos para não estragar o gráfico
-                        if producao < 1000:
-                            if data_inicio <= data_registro <= data_fim:
-                                dados_diarios[data_registro] = producao
-        except: pass
+                        if data_inicio <= data_registro <= data_fim:
+                            dados_diarios[data_registro] = producao
+        except Exception as e:
+            print(f"Erro mês {mes_obj}: {e}")
             
     progresso.empty()
     
@@ -166,7 +191,8 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
-# --- FUNÇÃO LISTAGEM (MANTIDA IGUAL) ---
+
+# --- FUNÇÃO LISTAGEM (CORRIGIDA) ---
 @st.cache_data(ttl=600)
 def listar_todas_usinas():
     lista = []
@@ -240,7 +266,6 @@ elif menu == "📄 Auditoria de Conta":
                     elif usina_vinculada["marca"] == "Huawei":
                         total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
-                    # --- MOSTRA OS RESULTADOS ---
                     col_metrica, col_fatura = st.columns(2)
                     col_metrica.metric("Geração Total (Inversor)", f"{total:.2f} kWh")
                     
@@ -248,24 +273,15 @@ elif menu == "📄 Auditoria de Conta":
                     
                     if not df_diario.empty:
                         st.subheader("📊 Histórico Diário")
-                        
-                        # --- CORREÇÃO VISUAL DO GRÁFICO ---
-                        # 1. Garante que o índice é datetime
+                        # Normalização do gráfico (preencher dias vazios com zero)
                         df_diario.index = pd.to_datetime(df_diario.index)
-                        
-                        # 2. Cria um calendário completo do início ao fim (preenche buracos com 0)
                         calendario_completo = pd.date_range(start=dt_inicio, end=dt_fim)
                         df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
-                        
-                        # 3. Formata a data para ficar bonitinha no eixo X (Dia/Mês)
                         df_completo.index = df_completo.index.strftime("%d/%m")
                         
-                        # 4. Plota o gráfico preenchido
-                        st.bar_chart(df_completo, color="#FFA500") 
-                        # ... código do gráfico acima ...
                         st.bar_chart(df_completo, color="#FFA500") 
                         
-                        # NOVO: Botão para ver os dados brutos
+                        # Tabela Detalhada
                         with st.expander("🔎 Ver Tabela Detalhada (Dia a Dia)"):
                             st.dataframe(df_completo.style.format("{:.2f} kWh"))
                     
@@ -274,7 +290,6 @@ elif menu == "📄 Auditoria de Conta":
                         st.divider()
                         if diff < -5:
                             st.error(f"⚠️ DIVERGÊNCIA NEGATIVA: {diff:.2f} kWh")
-                            st.caption("A concessionária creditou MENOS do que o inversor gerou.")
                         elif diff > 5:
                             st.warning(f"⚠️ DIVERGÊNCIA POSITIVA: +{diff:.2f} kWh")
                         else:
