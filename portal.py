@@ -109,14 +109,14 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
 
-# --- BUSCA HUAWEI "HÍBRIDA" (ARRASTÃO + HODÔMETRO) ---
+# --- BUSCA HUAWEI INTELIGENTE (ARRASTÃO + LÓGICA HÍBRIDA) ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
     
-    # Lista de dispositivos
+    # 1. TENTA DESCOBRIR DISPOSITIVOS (ARRASTÃO)
     dev_ids = []
     try:
         r = requests.post(f"{CREDS['huawei']['url']}/getDevList", json={"stationCodes": station_code}, headers=headers, timeout=10)
@@ -124,12 +124,11 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
         dev_ids = [d.get("id") for d in devices if d.get("id")]
     except: pass
 
-    # Se não achou dispositivos, tenta o ID da estação mesmo como fallback
+    # Fallback para Estação se não achar dispositivos
     if not dev_ids: dev_ids = [station_code]
 
-    st.toast(f"Analisando {len(dev_ids)} fontes de dados...", icon="⚡")
+    st.toast(f"Analisando {len(dev_ids)} fontes...", icon="⚡")
     
-    # Prepara datas (com margem de 1 mês para o cálculo do hodômetro)
     ts_inicio = pd.Timestamp(data_inicio)
     dt_safe_start = ts_inicio - timedelta(days=30)
     ts_fim = pd.Timestamp(data_fim)
@@ -140,11 +139,10 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     
     progresso = st.empty()
     
-    # Armazena dados brutos de cada dispositivo: { dev_id: { data: valor } }
+    # Armazena dados brutos: { dev_id: { data: valor } }
     dados_por_device = {}
 
     for dev_id in dev_ids:
-        # Define se é consulta de Device ou Station (fallback)
         is_station = (dev_id == station_code)
         endpoint = "/getKpiStationMonth" if is_station else "/getDevKpiMonth"
         payload_key = "stationCodes" if is_station else "devIds"
@@ -165,11 +163,7 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
                     for dia_kpi in dados:
                         mapa = dia_kpi.get("dataItemMap", {})
                         
-                        # Tenta pegar qualquer valor (Diário ou Acumulado)
-                        # daily_energy_yield = diário (ideal)
-                        # cumulative_energy = acumulado
-                        # inverter_power = as vezes é acumulado
-                        
+                        # Captura qualquer valor de energia disponível
                         val = float(mapa.get("daily_energy_yield", 0) or 
                                     mapa.get("daily_yield", 0) or 
                                     mapa.get("product_power", 0) or 
@@ -185,33 +179,47 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
 
     progresso.empty()
 
-    # --- PROCESSAMENTO DOS DADOS (O CÉREBRO) ---
+    # --- O CÉREBRO: DECIDE COMO TRATAR OS NÚMEROS ---
     df_final_diario = pd.DataFrame(columns=['kWh'])
     
     for dev_id, dados_dict in dados_por_device.items():
         if not dados_dict: continue
         
-        # Cria DataFrame do dispositivo
         df_dev = pd.DataFrame(list(dados_dict.items()), columns=['Data', 'Valor'])
         df_dev['Data'] = pd.to_datetime(df_dev['Data'])
         df_dev = df_dev.set_index('Data').sort_index()
         
-        # Análise: É acumulado ou diário?
-        media = df_dev['Valor'].mean()
+        # ANÁLISE DE PADRÃO
+        valores_validos = df_dev[df_dev['Valor'] > 0]
+        contagem = len(valores_validos)
+        media = valores_validos['Valor'].mean()
         
-        if media > 500: # Se a média for alta, é Acumulado -> Aplica Hodômetro
-            df_dev['kWh'] = df_dev['Valor'].diff().fillna(0)
-            # Remove valores negativos (erros) e zeros suspeitos se houver gap
-            df_dev = df_dev[df_dev['kWh'] >= 0]
-        else: # Se a média for baixa, é Diário -> Usa direto
-            df_dev['kWh'] = df_dev['Valor']
+        if contagem == 0:
+            continue
             
-        # Soma ao total geral (caso tenha mais de um inversor)
+        # LÓGICA 1: Resumo Mensal (Apenas 1 ou 2 valores gigantes no mês)
+        # Ex: Dia 1 = 1700, resto = 0.
+        if contagem <= 2 and media > 200:
+            # st.toast(f"Padrão Resumo Mensal detectado (ID {dev_id})", icon="📅")
+            df_dev['kWh'] = df_dev['Valor'] # Confia no valor, não faz diff
+            
+        # LÓGICA 2: Hodômetro (Muitos valores gigantes crescendo)
+        # Ex: 1700, 1750, 1800...
+        elif contagem > 2 and media > 500:
+            # st.toast(f"Padrão Acumulado detectado (ID {dev_id})", icon="📈")
+            df_dev['kWh'] = df_dev['Valor'].diff().fillna(0)
+            df_dev = df_dev[df_dev['kWh'] >= 0]
+            
+        # LÓGICA 3: Diário Normal (Valores pequenos)
+        # Ex: 50, 60, 40...
+        else:
+            df_dev['kWh'] = df_dev['Valor']
+
+        # Soma ao total geral
         df_final_diario = df_final_diario.add(df_dev[['kWh']], fill_value=0)
 
-    # Filtra pelo período que o usuário pediu
+    # Filtra período do usuário
     if not df_final_diario.empty:
-        # Garante indice datetime
         df_final_diario.index = pd.to_datetime(df_final_diario.index)
         mask = (df_final_diario.index >= ts_inicio) & (df_final_diario.index <= ts_fim)
         df_recorte = df_final_diario.loc[mask]
@@ -302,7 +310,6 @@ elif menu == "📄 Auditoria de Conta":
                         st.subheader("📊 Histórico Diário")
                         
                         df_diario.index = pd.to_datetime(df_diario.index)
-                        # Preenche buracos de dias sem geração
                         calendario_completo = pd.date_range(start=pd.to_datetime(dt_inicio), end=pd.to_datetime(dt_fim))
                         df_completo = df_diario.reindex(calendario_completo, fill_value=0.0)
                         
