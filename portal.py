@@ -1,18 +1,64 @@
 import streamlit as st
 import requests
 import json
-import os
 import hashlib
 import hmac
 import base64
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Portal Eon Solar", page_icon="☀️", layout="wide")
-DB_FILE = "clientes_eon.json"
 
-# --- CREDENCIAIS ---
+# --- CONEXÃO GOOGLE SHEETS (O Novo Cérebro) ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+def conectar_gsheets():
+    # Pega as credenciais que você colou no Secrets
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    client = gspread.authorize(credentials)
+    # Abre a planilha pelo nome exato
+    return client.open("Banco de Dados Eon").sheet1
+
+def carregar_clientes():
+    try:
+        sheet = conectar_gsheets()
+        rows = sheet.get_all_records()
+        # Converte a Tabela do Google para o Dicionário do Python
+        db = {}
+        for row in rows:
+            # Garante que as chaves existem para evitar erro de coluna vazia
+            if "Nome_Conta" in row and row["Nome_Conta"]:
+                db[row["Nome_Conta"]] = {
+                    "id": str(row["ID_Inversor"]),
+                    "marca": row["Marca"],
+                    "nome": row["Nome_Inversor"]
+                }
+        return db
+    except Exception as e:
+        # Se der erro (ex: planilha vazia ou nome errado), retorna vazio mas avisa no log
+        print(f"Erro ao ler planilha: {e}")
+        return {}
+
+def salvar_cliente(nome_conta, dados_usina):
+    try:
+        sheet = conectar_gsheets()
+        # Adiciona uma nova linha no final da planilha
+        sheet.append_row([
+            nome_conta,
+            str(dados_usina["id"]),
+            dados_usina["marca"],
+            dados_usina["nome"]
+        ])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar no Google Sheets: {e}")
+        return False
+
+# --- CREDENCIAIS DAS USINAS ---
 CREDS = {
     "huawei": {
         "user": "Eon.solar",
@@ -25,18 +71,6 @@ CREDS = {
         "url": "https://www.soliscloud.com:13333"
     }
 }
-
-# --- FUNÇÕES DE BANCO DE DADOS (Simples) ---
-def carregar_clientes():
-    if not os.path.exists(DB_FILE): return {}
-    try:
-        with open(DB_FILE, "r") as f: return json.load(f)
-    except: return {}
-
-def salvar_cliente(nome_conta, dados_usina):
-    db = carregar_clientes()
-    db[nome_conta] = dados_usina
-    with open(DB_FILE, "w") as f: json.dump(db, f)
 
 # --- FUNÇÕES DE API (Autenticação) ---
 def get_huawei_token():
@@ -58,7 +92,6 @@ def get_solis_auth(resource, body):
 # --- FUNÇÕES DE BUSCA HISTÓRICA (O Motor da Auditoria) ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
     total = 0.0
-    # Solis pede mês a mês. Vamos pegar o mês inicial e final
     meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
     if data_inicio.strftime("%Y-%m") not in meses: meses.append(data_inicio.strftime("%Y-%m"))
     
@@ -70,7 +103,6 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
             records = r.json().get("data", {}).get("records", [])
             for rec in records:
                 dia_str = rec.get("date", "")
-                # Ajuste data (as vezes vem só dia, as vezes YYYY-MM-DD)
                 if len(dia_str) < 3: full_date = f"{mes}-{int(dia_str):02d}"
                 else: full_date = dia_str
                 
@@ -83,70 +115,42 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     total_energia = 0.0
     token = get_huawei_token()
-    
     if not token:
         st.error("Falha de autenticação na Huawei.")
         return 0.0
 
-    # --- CORREÇÃO DO ERRO DE DATAS ---
-    # Convertemos tudo para Pandas Timestamp para evitar o TypeError na comparação
     ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
-
-    # 1. Gera lista de meses (usando os Timestamps)
     meses_para_consultar = pd.date_range(ts_inicio, ts_fim, freq='MS').tolist()
-    
-    # Adiciona o mês da data de início se ele não entrou na lista
-    # Agora comparamos Timestamp com Timestamp (compatíveis)
     if not meses_para_consultar or ts_inicio.replace(day=1) < meses_para_consultar[0]:
         meses_para_consultar.insert(0, ts_inicio.replace(day=1))
     
     headers = {"xsrf-token": token}
-    
-    # Barra de progresso para dar feedback visual (opcional, mas legal)
-    progresso_texto = st.empty()
+    progresso = st.empty()
 
     for mes_obj in meses_para_consultar:
-        progresso_texto.text(f"Consultando Huawei: Mês {mes_obj.month}/{mes_obj.year}...")
-        
-        # Timestamp em milissegundos do dia 1 do mês
+        progresso.text(f"Consultando Huawei: Mês {mes_obj.month}/{mes_obj.year}...")
         collect_time = int(datetime(mes_obj.year, mes_obj.month, 1).timestamp() * 1000)
-        
-        payload = {
-            "stationCodes": station_code,
-            "collectTime": collect_time
-        }
-        
+        payload = {"stationCodes": station_code, "collectTime": collect_time}
         try:
-            # getKpiStationMonth retorna os DADOS DIÁRIOS daquele mês
             r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=15)
             dados = r.json().get("data", [])
-            
-            # A resposta vem como uma lista de dias
             if isinstance(dados, list):
                 for dia_kpi in dados:
                     mapa = dia_kpi.get("dataItemMap", {})
-                    
-                    # Extrai a produção do dia
                     producao = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
-                    
-                    # A Huawei retorna o "collectTime" do dia.
                     tempo_ms = dia_kpi.get("collectTime", 0)
                     if tempo_ms > 0:
-                        # Convertemos para date simples para comparar com o input do usuário
                         data_registro = datetime.fromtimestamp(tempo_ms / 1000).date()
-                        
-                        # O PULO DO GATO: Só soma se estiver dentro do período escolhido
-                        # Como data_inicio e data_fim são date, e data_registro é date, aqui funciona!
                         if data_inicio <= data_registro <= data_fim:
                             total_energia += producao
         except Exception as e:
             print(f"Erro mês {mes_obj}: {e}")
             
-    progresso_texto.empty() # Limpa o texto de carregamento
+    progresso.empty()
     return total_energia
 
-# --- FUNÇÃO DE LISTAGEM (Para o Dropdown) ---
+# --- FUNÇÃO DE LISTAGEM ---
 @st.cache_data(ttl=600)
 def listar_todas_usinas():
     lista = []
@@ -174,7 +178,9 @@ menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria de Conta", 
 
 if menu == "🏠 Home":
     st.title("Dashboard Geral")
-    db = carregar_clientes()
+    with st.spinner("Carregando banco de dados da nuvem..."):
+        db = carregar_clientes()
+    
     col1, col2 = st.columns(2)
     col1.metric("Clientes Cadastrados", len(db))
     col2.metric("Status do Sistema", "Online 🟢")
@@ -184,26 +190,28 @@ elif menu == "📄 Auditoria de Conta":
     nome_input = st.text_input("Nome na Conta de Luz:", placeholder="Ex: JOAO DA SILVA").upper().strip()
     
     if nome_input:
+        # Carrega SEMPRE da nuvem para garantir dados frescos
         db = carregar_clientes()
         st.divider()
         
-        # LÓGICA DE VÍNCULO
         usina_vinculada = None
         if nome_input in db:
             usina_vinculada = db[nome_input]
             st.success(f"✅ Cliente identificado: **{usina_vinculada['nome']}** ({usina_vinculada['marca']})")
         else:
-            st.warning("Cliente novo. Vamos vincular?")
+            st.warning(f"Cliente '{nome_input}' não encontrado na planilha.")
+            st.write("Vamos cadastrar agora?")
             opcoes = listar_todas_usinas()
             nomes = [u["display"] for u in opcoes]
             escolha = st.selectbox("Selecione o Inversor:", ["Selecione..."] + nomes)
             if escolha != "Selecione...":
-                if st.button("💾 Salvar Vínculo"):
-                    obj = next(u for u in opcoes if u["display"] == escolha)
-                    salvar_cliente(nome_input, obj)
-                    st.rerun()
+                if st.button("💾 Salvar na Planilha"):
+                    with st.spinner("Salvando no Google Sheets..."):
+                        obj = next(u for u in opcoes if u["display"] == escolha)
+                        if salvar_cliente(nome_input, obj):
+                            st.toast("Salvo com sucesso!", icon="☁️")
+                            st.rerun()
 
-        # SE JÁ TIVER VÍNCULO, MOSTRA CALCULADORA
         if usina_vinculada:
             st.subheader("🗓️ Período da Fatura")
             c1, c2 = st.columns(2)
@@ -213,33 +221,28 @@ elif menu == "📄 Auditoria de Conta":
             if st.button("🚀 Calcular Geração Real"):
                 with st.spinner(f"Consultando {usina_vinculada['marca']}..."):
                     geracao = 0.0
-                    
-                    # --- SOLIS ---
                     if usina_vinculada["marca"] == "Solis":
                         geracao = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
-                    
-                    # --- HUAWEI (AGORA DESTRAVADO) ---
                     elif usina_vinculada["marca"] == "Huawei":
-                        # Chama a função nova V2.0 que você já colou lá em cima
                         geracao = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
                     st.metric(label="Geração no Período", value=f"{geracao:.2f} kWh")
                     
-                    # Comparação Simples
                     fatura = st.number_input("Quanto a concessionária creditou? (kWh)", value=0.0)
                     if fatura > 0:
                         diff = fatura - geracao
                         st.divider()
-                        if diff < -5: # Margem de erro de 5 kWh
+                        if diff < -5:
                             st.error(f"⚠️ A concessionária comeu {abs(diff):.2f} kWh!")
                             st.write(f"Era para ter: **{geracao:.2f}** | Veio: **{fatura:.2f}**")
                         elif diff > 5:
-                            st.warning(f"🤔 Estranho... A concessionária creditou {diff:.2f} kWh A MAIS.")
+                            st.warning(f"🤔 Estranho... Creditou {diff:.2f} kWh A MAIS.")
                         else:
-                            st.success(f"✅ Tudo certo! Diferença de {diff:.2f} kWh (dentro da margem técnica).")
+                            st.success(f"✅ Tudo certo! Diferença de {diff:.2f} kWh.")
 
 elif menu == "⚙️ Configurações":
-    st.json(carregar_clientes())
-    if st.button("Resetar Banco de Dados"):
-        if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    st.write("Banco de Dados (Google Sheets):")
+    st.info("Os dados agora estão seguros na sua planilha 'Banco de Dados Eon'.")
+    if st.button("Recarregar Dados da Nuvem"):
+        st.cache_data.clear()
         st.rerun()
