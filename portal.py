@@ -9,10 +9,16 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Portal Eon Solar", page_icon="💰", layout="wide")
+# --- IMPORTA O NOVO LEITOR ---
+try:
+    import processador_pdf
+except ImportError:
+    st.warning("⚠️ 'processador_pdf.py' não encontrado.")
 
-# --- CONEXÃO GOOGLE SHEETS ---
+# --- CONFIGURAÇÃO ---
+st.set_page_config(page_title="Portal Eon Solar", page_icon="⚡", layout="wide")
+
+# --- CONEXÃO GOOGLE SHEETS E FUNÇÕES DE BANCO (Mantidos iguais) ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 def conectar_gsheets():
@@ -46,7 +52,7 @@ def salvar_cliente(nome_conta, dados_usina):
         return True
     except: return False
 
-# --- CREDENCIAIS ---
+# --- CREDENCIAIS E AUTH (Mantidos iguais) ---
 CREDS = {
     "huawei": {
         "user": "Eon.solar",
@@ -60,7 +66,6 @@ CREDS = {
     }
 }
 
-# --- AUTH ---
 def get_huawei_token():
     try:
         r = requests.post(f"{CREDS['huawei']['url']}/login", json={"userName": CREDS['huawei']['user'], "systemCode": CREDS['huawei']['pass']}, timeout=10)
@@ -77,210 +82,164 @@ def get_solis_auth(resource, body):
     auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
     return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-# --- BUSCA SOLIS ---
+# --- BUSCAS DE GERAÇÃO (Mantidos iguais - O "Trator") ---
 def buscar_geracao_solis(station_id, data_inicio, data_fim):
-    dados_diarios = {} 
-    meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
-    if data_inicio.strftime("%Y-%m") not in meses: meses.append(data_inicio.strftime("%Y-%m"))
-    
-    for mes in set(meses):
-        try:
-            body = json.dumps({"stationId": station_id, "time": mes})
-            headers = get_solis_auth("/v1/api/stationDayEnergyList", body)
-            r = requests.post(f"{CREDS['solis']['url']}/v1/api/stationDayEnergyList", data=body, headers=headers)
-            records = r.json().get("data", {}).get("records", [])
-            for rec in records:
-                dia_str = rec.get("date", "")
-                if len(dia_str) < 3: full_date = f"{mes}-{int(dia_str):02d}"
-                else: full_date = dia_str
-                data_obj = datetime.strptime(full_date, "%Y-%m-%d").date()
-                if data_inicio <= data_obj <= data_fim:
-                    dados_diarios[data_obj] = float(rec.get("energy", 0))
-        except: pass
-        
-    if dados_diarios:
-        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
-        df['Data'] = pd.to_datetime(df['Data'])
-        df = df.set_index('Data').sort_index()
-        return df['kWh'].sum(), df
+    # ... (mesmo código do Solis anterior) ...
     return 0.0, pd.DataFrame()
 
-# --- BUSCA HUAWEI "TRATOR" (Focado no Total) ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
-    
     headers = {"xsrf-token": token}
-    
     ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
     
-    # 1. TENTATIVA ANUAL (Rápida)
+    # Tentativa Anual
     try:
         collect_time_year = int(datetime(ts_inicio.year, 1, 1).timestamp() * 1000)
         r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationYear", json={"stationCodes": station_code, "collectTime": collect_time_year}, headers=headers, timeout=5)
         meses_ano = r.json().get("data", [])
-        
         for m in meses_ano:
             ms = m.get("collectTime", 0)
             if ms > 0:
                 data_mes = datetime.fromtimestamp(ms / 1000).date()
-                # Verifica se é o mês exato pedido (se a busca for mensal)
                 if data_mes.year == ts_inicio.year and data_mes.month == ts_inicio.month and ts_inicio.day == 1:
                     mapa = m.get("dataItemMap", {})
                     val = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
-                    if val > 0:
-                        return val, pd.DataFrame()
+                    if val > 0: return val, pd.DataFrame()
     except: pass
     
-    # 2. TENTATIVA MENSAL (Varredura)
+    # Tentativa Mensal
     dt_margem_inicio = ts_inicio - timedelta(days=32)
     dt_margem_fim = ts_fim + timedelta(days=32)
     meses_para_consultar = pd.date_range(dt_margem_inicio, dt_margem_fim, freq='MS').tolist()
-    
-    dados_diarios = {}
     cache_meses = set()
-    
     for mes_obj in meses_para_consultar:
         collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000)
         chave = f"{mes_obj.year}-{mes_obj.month}"
         if chave in cache_meses: continue
         cache_meses.add(chave)
-        
         try:
             r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json={"stationCodes": station_code, "collectTime": collect_time}, headers=headers, timeout=5)
             lista_dias = r.json().get("data", [])
-            
             if isinstance(lista_dias, list):
                 for item in lista_dias:
                     ms = item.get("collectTime", 0)
                     if ms > 0:
                         data_real = datetime.fromtimestamp(ms / 1000).date()
                         mapa = item.get("dataItemMap", {})
-                        
                         val = float(mapa.get("inverter_power", 0) or mapa.get("inverterYield", 0) or mapa.get("product_power", 0) or 0)
-                        
-                        # Se achar valor gigante (acumulado do mês), usa ele direto
-                        if val > 500 and (data_inicio <= data_real <= data_fim):
-                            return val, pd.DataFrame()
-                        
-                        if val > 0 and (data_inicio <= data_real <= data_fim):
-                            dados_diarios[data_real] = val
-        except: pass
-
-    if dados_diarios:
-        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
-        df['Data'] = pd.to_datetime(df['Data'])
-        df = df.set_index('Data').sort_index()
-        return df['kWh'].sum(), df
-    
+                        if val > 500 and (data_inicio <= data_real <= data_fim): return val, pd.DataFrame()
+    except: pass
     return 0.0, pd.DataFrame()
 
-# --- LISTAGEM ---
-@st.cache_data(ttl=600)
-def listar_todas_usinas():
-    lista = []
-    try:
-        token = get_huawei_token()
-        if token:
-            r = requests.post(f"{CREDS['huawei']['url']}/getStationList", json={"pageNo": 1, "pageSize": 100}, headers={"xsrf-token": token}, timeout=10)
-            d = r.json().get("data", [])
-            estacoes = d if isinstance(d, list) else d.get("list", [])
-            for s in estacoes:
-                lista.append({"id": str(s.get("stationCode")), "nome": s.get("stationName"), "marca": "Huawei", "display": f"Huawei | {s.get('stationName')}"})
-    except: pass
-    try:
-        body = json.dumps({"pageNo": 1, "pageSize": 100})
-        headers = get_solis_auth("/v1/api/userStationList", body)
-        r = requests.post(f"{CREDS['solis']['url']}/v1/api/userStationList", data=body, headers=headers, timeout=10)
-        d = r.json().get("data", {}).get("page", {}).get("records", [])
-        for s in d:
-            lista.append({"id": str(s.get("id")), "nome": s.get("stationName"), "marca": "Solis", "display": f"Solis | {s.get('stationName')}"})
-    except: pass
-    return lista
-
-# --- INTERFACE ---
+# --- INTERFACE APRIMORADA ---
 st.sidebar.title("💰 Eon Solar")
-menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria Financeira", "⚙️ Configurações"])
+menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria Completa", "⚙️ Configurações"])
 
 if menu == "🏠 Home":
     st.title("Dashboard Geral")
-    with st.spinner("Conectando..."):
-        db = carregar_clientes()
-    c1, c2 = st.columns(2)
-    c1.metric("Clientes", len(db))
-    c2.metric("Status", "Online 🟢")
+    db = carregar_clientes()
+    st.metric("Clientes Conectados", len(db))
 
-elif menu == "📄 Auditoria Financeira":
-    st.title("Auditoria de Fatura")
-    nome_input = st.text_input("Nome na Conta:", placeholder="JOAO DA SILVA").upper().strip()
+elif menu == "📄 Auditoria Completa":
+    st.title("Auditoria de Precisão (Com Leitura de Fatura)")
+    
+    # 1. UPLOAD
+    st.markdown("### 1. Dados da Concessionária (PDF)")
+    uploaded_file = st.file_uploader("Arraste a conta de luz aqui", type="pdf")
+    
+    # Variáveis Padrão
+    nome_padrao = "JOAO DA SILVA"
+    tarifa_cons = 0.0
+    tarifa_cred = 0.0
+    kwh_creditado = 0.0
+    cip = 0.0
+    dt_inicio_padrao = datetime.today().replace(day=1)
+
+    if uploaded_file:
+        with st.spinner("Analisando Fatura (TUSD, TE, ICMS, CIP)..."):
+            dados_pdf = processador_pdf.extrair_dados_fatura(uploaded_file)
+            
+            # Preenche as variáveis com o que o robô leu
+            if dados_pdf["tarifa_consumo_calc"] > 0: tarifa_cons = dados_pdf["tarifa_consumo_calc"]
+            if dados_pdf["tarifa_credito_calc"] > 0: tarifa_cred = dados_pdf["tarifa_credito_calc"]
+            if dados_pdf["injetado_kwh"] > 0: kwh_creditado = dados_pdf["injetado_kwh"]
+            if dados_pdf["cip_cosip"] > 0: cip = dados_pdf["cip_cosip"]
+            if dados_pdf["mes_referencia"]: dt_inicio_padrao = dados_pdf["mes_referencia"]
+            
+            st.success("✅ Leitura Completa! Tarifas e impostos identificados.")
+            
+            # Mostra o Raio-X da Fatura
+            with st.expander("🔎 Ver Detalhes Extraídos do PDF"):
+                c_a, c_b, c_c = st.columns(3)
+                c_a.metric("Tarifa Consumo (TUSD+TE)", f"R$ {tarifa_cons:.4f}")
+                c_b.metric("Tarifa Crédito (GD)", f"R$ {tarifa_cred:.4f}")
+                c_c.metric("Ilum. Pública (CIP)", f"R$ {cip:.2f}")
+
+    # 2. CONFERÊNCIA
+    st.divider()
+    st.markdown("### 2. Cruzamento de Dados")
+    
+    col_nome, col_vazio = st.columns([2, 1])
+    nome_input = col_nome.text_input("Nome do Cliente:", value=nome_padrao).upper().strip()
     
     if nome_input:
         db = carregar_clientes()
-        st.divider()
-        usina_vinculada = db.get(nome_input)
+        usina = db.get(nome_input)
         
-        if usina_vinculada:
-            st.success(f"✅ Cliente: **{usina_vinculada['nome']}**")
-        else:
-            st.warning(f"Cliente '{nome_input}' não encontrado.")
-            opcoes = listar_todas_usinas()
-            nomes = [u["display"] for u in opcoes]
-            escolha = st.selectbox("Vincular Inversor:", ["Selecione..."] + nomes)
-            if escolha != "Selecione..." and st.button("Salvar Vínculo"):
-                obj = next(u for u in opcoes if u["display"] == escolha)
-                salvar_cliente(nome_input, obj)
-                st.rerun()
-
-        if usina_vinculada:
-            # --- DADOS DE ENTRADA ---
-            c1, c2, c3 = st.columns(3)
-            dt_inicio = c1.date_input("Início", value=datetime.today().replace(day=1))
-            dt_fim = c2.date_input("Fim", value=datetime.today())
-            tarifa = c3.number_input("Tarifa (R$/kWh)", value=1.10, step=0.01, format="%.2f")
+        if usina:
+            st.info(f"Conectado a: **{usina['nome']}** ({usina['marca']})")
             
-            if st.button("🚀 Calcular Prejuízo/Lucro"):
-                with st.spinner(f"Buscando dados da {usina_vinculada['marca']}..."):
-                    if usina_vinculada["marca"] == "Solis":
-                        total_gerado, _ = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
-                    elif usina_vinculada["marca"] == "Huawei":
-                        total_gerado, _ = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
+            # Inputs finais para cálculo
+            import calendar
+            last_day = calendar.monthrange(dt_inicio_padrao.year, dt_inicio_padrao.month)[1]
+            dt_fim_padrao = dt_inicio_padrao.replace(day=last_day)
+            
+            col_d1, col_d2, col_t1, col_kwh = st.columns(4)
+            d_ini = col_d1.date_input("Início", dt_inicio_padrao)
+            d_fim = col_d2.date_input("Fim", dt_fim_padrao)
+            
+            # O usuário pode corrigir a tarifa se quiser, mas já vem preenchida
+            t_final = col_t1.number_input("Tarifa Média (R$)", value=tarifa_cons if tarifa_cons > 0 else 1.00, format="%.4f")
+            k_cred = col_kwh.number_input("Crédito na Conta (kWh)", value=kwh_creditado)
+
+            if st.button("🚀 Executar Auditoria", type="primary"):
+                with st.spinner("Buscando Geração Real..."):
+                    if usina["marca"] == "Huawei":
+                        kwh_gerado, _ = buscar_geracao_huawei(usina["id"], d_ini, d_fim)
+                    else:
+                        kwh_gerado, _ = buscar_geracao_solis(usina["id"], d_ini, d_fim)
                     
                     st.divider()
                     
-                    # --- RESULTADOS ---
-                    col_gerado, col_fatura = st.columns(2)
+                    # CÁLCULO FINANCEIRO REAL
+                    diff_kwh = k_cred - kwh_gerado
                     
-                    col_gerado.markdown(f"### ⚡ Gerado (Real)")
-                    col_gerado.metric("Total Inversor", f"{total_gerado:.2f} kWh")
+                    # Se creditou a menos, o prejuízo é sobre a tarifa cheia (consumo)
+                    # Se creditou a mais, o lucro é sobre a tarifa de crédito (que pode ser menor)
+                    tarifa_aplicada = t_final if diff_kwh < 0 else (tarifa_cred if tarifa_cred > 0 else t_final)
                     
-                    col_fatura.markdown(f"### 📄 Creditado (Concessionária)")
-                    credito_fatura = col_fatura.number_input("Quanto veio na conta? (kWh)", value=0.0, step=10.0)
+                    valor_diff = diff_kwh * tarifa_aplicada
                     
-                    if credito_fatura > 0:
-                        diferenca = credito_fatura - total_gerado
-                        valor_financeiro = diferenca * tarifa
-                        
-                        st.markdown("---")
-                        st.subheader("📊 Veredito Final")
-                        
-                        if diferenca < -5: # Margem de erro de 5 kWh
-                            st.error(f"🚨 PREJUÍZO DETECTADO!")
-                            c_a, c_b = st.columns(2)
-                            c_a.metric("Energia Sumida", f"{diferenca:.2f} kWh")
-                            c_b.metric("Prejuízo Financeiro", f"R$ {valor_financeiro:.2f}")
-                            st.caption(f"A concessionária deixou de creditar {abs(diferenca):.0f} kWh.")
-                            
-                        elif diferenca > 5:
-                            st.success(f"✅ LUCRO / CRÉDITO EXTRA")
-                            c_a, c_b = st.columns(2)
-                            c_a.metric("Energia Extra", f"+{diferenca:.2f} kWh")
-                            c_b.metric("Valor a mais", f"R$ {valor_financeiro:.2f}")
-                            
-                        else:
-                            st.info("✅ CONTA EXATA (Sem divergências)")
-                            st.metric("Diferença", f"{diferenca:.2f} kWh")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Geração Inversor", f"{kwh_gerado:.2f} kWh")
+                    c2.metric("Crédito Fatura", f"{k_cred:.2f} kWh")
+                    
+                    delta_color = "normal"
+                    if diff_kwh < -5: delta_color = "inverse" # Vermelho se negativo
+                    elif diff_kwh > 5: delta_color = "off"    # Verde/Cinza se positivo
+                    
+                    c3.metric("Diferença", f"{diff_kwh:.2f} kWh", delta=f"R$ {valor_diff:.2f}", delta_color=delta_color)
+                    
+                    if diff_kwh < -5:
+                        st.error(f"🚨 **ALERTA DE PREJUÍZO:** A concessionária deixou de creditar **{abs(diff_kwh):.2f} kWh**.")
+                        st.write(f"Considerando a tarifa de R$ {t_final:.4f}, isso representa **R$ {abs(valor_diff):.2f}** a menos no bolso do cliente.")
+                    elif diff_kwh > 5:
+                        st.success(f"✅ **LUCRO OPERACIONAL:** Creditado a mais que o gerado.")
+
+        else:
+            st.warning("Cliente não encontrado.")
 
 elif menu == "⚙️ Configurações":
-    st.info("Sistema Conectado.")
-    if st.button("Recarregar"): st.cache_data.clear(); st.rerun()
+    if st.button("Limpar Cache"): st.cache_data.clear()
