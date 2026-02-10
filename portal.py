@@ -4,10 +4,10 @@ import json
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Microscópio Final", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="CSI Huawei - Investigação", page_icon="🕵️", layout="wide")
 
 # --- CONEXÃO GOOGLE SHEETS ---
 def conectar_gsheets():
@@ -49,86 +49,67 @@ def get_token():
     return None
 
 # --- INTERFACE ---
-st.title("🔬 Microscópio: A Busca pelos 62.20 kWh")
+st.title("🕵️ CSI: Investigação da Curva")
 
 db = carregar_clientes()
 col1, col2 = st.columns(2)
 nome_input = col1.text_input("Cliente:", "JOAO DA SILVA").upper().strip()
-data_alvo = col2.date_input("Data Alvo (Dia do Erro):", datetime(2026, 1, 1))
+data_alvo = col2.date_input("Dia do Erro (ex: 01/01):", datetime(2026, 1, 1))
 
 usina = db.get(nome_input)
 
 if usina:
     st.info(f"Analisando: **{nome_input}** (ID: `{usina['id']}`)")
     
-    if st.button("🔎 INVESTIGAR A FUNDO"):
+    if st.button("🔬 ABRIR PACOTE DE DADOS"):
         token = get_token()
         headers = {"xsrf-token": token}
         
-        # 1. VISÃO GERAL DO MÊS (Para ver se só o dia 1 está errado)
-        st.subheader("1. Tabela Mensal (Janeiro)")
-        data_segura = data_alvo.replace(day=15) # Pede dia 15 para pegar o mês certo
-        collect_time_month = int(datetime(data_segura.year, data_segura.month, data_segura.day).timestamp() * 1000)
-        
-        try:
-            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json={"stationCodes": usina['id'], "collectTime": collect_time_month}, headers=headers)
-            dados_mes = r.json().get("data", [])
-            
-            tabela = []
-            for item in dados_mes:
-                dt = datetime.fromtimestamp(item["collectTime"]/1000).strftime("%d/%m")
-                val = item.get("dataItemMap", {}).get("inverter_power", 0)
-                tabela.append({"Dia": dt, "Valor (kWh)": val})
-            
-            df = pd.DataFrame(tabela)
-            # Mostra os primeiros 5 dias para vermos o contraste
-            st.dataframe(df.head(10), use_container_width=True)
-            
-        except Exception as e: st.error(str(e))
-        
-        # 2. TENTATIVA DE RESGATE (INTEGRAL DA CURVA)
-        st.subheader(f"2. Tentativa de Resgate: Reconstruir o dia {data_alvo.strftime('%d/%m')}")
-        st.caption("Baixando potência a cada 5 minutos para somar manualmente...")
-        
         collect_time_day = int(datetime(data_alvo.year, data_alvo.month, data_alvo.day).timestamp() * 1000)
         
+        st.write(f"Baixando curva do dia {data_alvo.strftime('%d/%m/%Y')}...")
+        
+        # 1. TENTA PEGAR A CURVA
         try:
-            # Pede a curva intra-dia (getKpiStationDay)
             r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationDay", json={"stationCodes": usina['id'], "collectTime": collect_time_day}, headers=headers)
             dados_curva = r.json().get("data", [])
             
             if dados_curva:
-                pontos = []
-                soma_potencias = 0
-                contagem = 0
+                qtd = len(dados_curva)
+                st.success(f"📦 Encontrados {qtd} pacotes de dados neste dia!")
                 
-                for p in dados_curva:
-                    # active_power geralmente vem em kW
-                    pot = p.get("dataItemMap", {}).get("active_power", 0)
-                    if pot is not None:
-                        soma_potencias += float(pot)
-                        contagem += 1
-                        pontos.append(float(pot))
+                # PEGA O PACOTE DO MEIO-DIA (Para garantir que tem sol e geração)
+                # Se pegar o primeiro (00:00) vai ser zero mesmo.
+                indice_meio_dia = int(qtd / 2) 
+                pacote_amostra = dados_curva[indice_meio_dia]
                 
-                if contagem > 0:
-                    # Cálculo: Soma das potências (kW) / 12 (pois são amostras de 5 min = 12 por hora)
-                    estimativa = soma_potencias / 12
-                    
-                    c1, c2 = st.columns(2)
-                    c1.metric("Pontos de Curva Encontrados", contagem)
-                    c2.metric("Geração Recalculada", f"{estimativa:.2f} kWh")
-                    
-                    st.line_chart(pontos)
-                    
-                    if abs(estimativa - 62.20) < 5:
-                        st.success("🎉 SUCESSO! Conseguimos reconstruir o valor através da curva!")
-                    else:
-                        st.warning(f"O valor recalculado ({estimativa:.2f}) ainda está diferente de 62.20. A amostragem pode não ser de 5 min.")
+                hora_pacote = datetime.fromtimestamp(pacote_amostra["collectTime"]/1000).strftime('%H:%M:%S')
+                
+                st.divider()
+                st.markdown(f"### 🧬 Conteúdo do Pacote das {hora_pacote}")
+                st.markdown("Procure abaixo qualquer campo que tenha valor maior que 0:")
+                
+                # EXIBE O MAPA DE DADOS CRU
+                mapa = pacote_amostra.get("dataItemMap", {})
+                st.json(mapa)
+                
+                # DICA AUTOMÁTICA
+                candidatos = []
+                for k, v in mapa.items():
+                    try:
+                        if float(v) > 0:
+                            candidatos.append(f"{k} = {v}")
+                    except: pass
+                
+                if candidatos:
+                    st.success("💡 Campos com valor encontrados:")
+                    for c in candidatos:
+                        st.code(c)
                 else:
-                    st.error("A curva de potência veio zerada.")
+                    st.warning("⚠️ Todos os campos neste pacote estão zerados ou nulos.")
+                    
             else:
-                st.error("A API não entregou a curva intra-dia para esta data (Lista Vazia).")
-                st.write("JSON Retornado:", r.json())
+                st.error("A API retornou lista vazia [] para a curva deste dia.")
                 
         except Exception as e: st.error(str(e))
 
