@@ -10,7 +10,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Portal Eon Solar", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Portal Eon Solar", page_icon="💰", layout="wide")
 
 # --- CONEXÃO GOOGLE SHEETS ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -111,16 +111,12 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
-    total_final = 0.0
     
-    # Datas para consulta
     ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
     
-    # 1. TENTATIVA ANUAL (Mais limpa)
-    # Baixa o ano inteiro e procura o mês específico
+    # 1. TENTATIVA ANUAL (Rápida)
     try:
-        st.toast(f"Consultando fechamento anual...", icon="📅")
         collect_time_year = int(datetime(ts_inicio.year, 1, 1).timestamp() * 1000)
         r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationYear", json={"stationCodes": station_code, "collectTime": collect_time_year}, headers=headers, timeout=5)
         meses_ano = r.json().get("data", [])
@@ -129,18 +125,15 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
             ms = m.get("collectTime", 0)
             if ms > 0:
                 data_mes = datetime.fromtimestamp(ms / 1000).date()
-                # Se o mês do registro for o mesmo do mês pedido (ex: Janeiro)
-                if data_mes.year == ts_inicio.year and data_mes.month == ts_inicio.month:
+                # Verifica se é o mês exato pedido (se a busca for mensal)
+                if data_mes.year == ts_inicio.year and data_mes.month == ts_inicio.month and ts_inicio.day == 1:
                     mapa = m.get("dataItemMap", {})
                     val = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
                     if val > 0:
-                        return val, pd.DataFrame() # Retorna direto se achou!
+                        return val, pd.DataFrame()
     except: pass
     
-    # 2. TENTATIVA MENSAL (Se anual falhou, varre dias)
-    # Baixa Mês Anterior + Atual + Seguinte para garantir que pegamos tudo
-    st.toast(f"Varrendo registros diários...", icon="🔍")
-    
+    # 2. TENTATIVA MENSAL (Varredura)
     dt_margem_inicio = ts_inicio - timedelta(days=32)
     dt_margem_fim = ts_fim + timedelta(days=32)
     meses_para_consultar = pd.date_range(dt_margem_inicio, dt_margem_fim, freq='MS').tolist()
@@ -149,7 +142,7 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     cache_meses = set()
     
     for mes_obj in meses_para_consultar:
-        collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000) # Dia 15 para segurança
+        collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000)
         chave = f"{mes_obj.year}-{mes_obj.month}"
         if chave in cache_meses: continue
         cache_meses.add(chave)
@@ -165,21 +158,16 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
                         data_real = datetime.fromtimestamp(ms / 1000).date()
                         mapa = item.get("dataItemMap", {})
                         
-                        # Pega valor de energia
                         val = float(mapa.get("inverter_power", 0) or mapa.get("inverterYield", 0) or mapa.get("product_power", 0) or 0)
                         
-                        # ESTRATÉGIA "O DIA GIGANTE"
-                        # Se acharmos um valor > 500 kWh num dia só, isso é o TOTAL DO MÊS bugado. Usamos ele.
+                        # Se achar valor gigante (acumulado do mês), usa ele direto
                         if val > 500 and (data_inicio <= data_real <= data_fim):
-                            st.toast(f"Encontrado registro consolidado no dia {data_real.strftime('%d/%m')}", icon="📦")
-                            return val, pd.DataFrame() # Retorna o valor gigante como total
+                            return val, pd.DataFrame()
                         
-                        # Se for valor normal, guarda para somar
                         if val > 0 and (data_inicio <= data_real <= data_fim):
                             dados_diarios[data_real] = val
         except: pass
 
-    # 3. SOMA MANUAL (Se não achou gigante)
     if dados_diarios:
         df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
         df['Data'] = pd.to_datetime(df['Data'])
@@ -212,8 +200,8 @@ def listar_todas_usinas():
     return lista
 
 # --- INTERFACE ---
-st.sidebar.title("☀️ Eon Solar")
-menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria de Conta", "⚙️ Configurações"])
+st.sidebar.title("💰 Eon Solar")
+menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria Financeira", "⚙️ Configurações"])
 
 if menu == "🏠 Home":
     st.title("Dashboard Geral")
@@ -223,8 +211,8 @@ if menu == "🏠 Home":
     c1.metric("Clientes", len(db))
     c2.metric("Status", "Online 🟢")
 
-elif menu == "📄 Auditoria de Conta":
-    st.title("Nova Auditoria")
+elif menu == "📄 Auditoria Financeira":
+    st.title("Auditoria de Fatura")
     nome_input = st.text_input("Nome na Conta:", placeholder="JOAO DA SILVA").upper().strip()
     
     if nome_input:
@@ -239,35 +227,59 @@ elif menu == "📄 Auditoria de Conta":
             opcoes = listar_todas_usinas()
             nomes = [u["display"] for u in opcoes]
             escolha = st.selectbox("Vincular Inversor:", ["Selecione..."] + nomes)
-            if escolha != "Selecione..." and st.button("Salvar"):
+            if escolha != "Selecione..." and st.button("Salvar Vínculo"):
                 obj = next(u for u in opcoes if u["display"] == escolha)
                 salvar_cliente(nome_input, obj)
                 st.rerun()
 
         if usina_vinculada:
-            st.subheader("🗓️ Análise de Geração")
-            c1, c2 = st.columns(2)
+            # --- DADOS DE ENTRADA ---
+            c1, c2, c3 = st.columns(3)
             dt_inicio = c1.date_input("Início", value=datetime.today().replace(day=1))
             dt_fim = c2.date_input("Fim", value=datetime.today())
+            tarifa = c3.number_input("Tarifa (R$/kWh)", value=1.10, step=0.01, format="%.2f")
             
-            if st.button("🚀 Auditar Geração"):
-                with st.spinner(f"Obtendo total da {usina_vinculada['marca']}..."):
+            if st.button("🚀 Calcular Prejuízo/Lucro"):
+                with st.spinner(f"Buscando dados da {usina_vinculada['marca']}..."):
                     if usina_vinculada["marca"] == "Solis":
-                        total, df_diario = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
+                        total_gerado, _ = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
                     elif usina_vinculada["marca"] == "Huawei":
-                        total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
+                        total_gerado, _ = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
-                    # RESULTADO PRINCIPAL (GRANDE)
-                    st.metric("Geração Total no Período", f"{total:.2f} kWh")
+                    st.divider()
                     
-                    fatura = st.number_input("Crédito na Fatura (kWh)", value=0.0)
+                    # --- RESULTADOS ---
+                    col_gerado, col_fatura = st.columns(2)
                     
-                    if fatura > 0:
-                        diff = fatura - total
-                        st.divider()
-                        if diff < -5: st.error(f"⚠️ DIVERGÊNCIA: {diff:.2f} kWh (Faltou crédito)")
-                        elif diff > 5: st.warning(f"⚠️ DIVERGÊNCIA: +{diff:.2f} kWh (Sobrou crédito)")
-                        else: st.success(f"✅ CONTA BATIDA (Diferença: {diff:.2f} kWh)")
+                    col_gerado.markdown(f"### ⚡ Gerado (Real)")
+                    col_gerado.metric("Total Inversor", f"{total_gerado:.2f} kWh")
+                    
+                    col_fatura.markdown(f"### 📄 Creditado (Concessionária)")
+                    credito_fatura = col_fatura.number_input("Quanto veio na conta? (kWh)", value=0.0, step=10.0)
+                    
+                    if credito_fatura > 0:
+                        diferenca = credito_fatura - total_gerado
+                        valor_financeiro = diferenca * tarifa
+                        
+                        st.markdown("---")
+                        st.subheader("📊 Veredito Final")
+                        
+                        if diferenca < -5: # Margem de erro de 5 kWh
+                            st.error(f"🚨 PREJUÍZO DETECTADO!")
+                            c_a, c_b = st.columns(2)
+                            c_a.metric("Energia Sumida", f"{diferenca:.2f} kWh")
+                            c_b.metric("Prejuízo Financeiro", f"R$ {valor_financeiro:.2f}")
+                            st.caption(f"A concessionária deixou de creditar {abs(diferenca):.0f} kWh.")
+                            
+                        elif diferenca > 5:
+                            st.success(f"✅ LUCRO / CRÉDITO EXTRA")
+                            c_a, c_b = st.columns(2)
+                            c_a.metric("Energia Extra", f"+{diferenca:.2f} kWh")
+                            c_b.metric("Valor a mais", f"R$ {valor_financeiro:.2f}")
+                            
+                        else:
+                            st.info("✅ CONTA EXATA (Sem divergências)")
+                            st.metric("Diferença", f"{diferenca:.2f} kWh")
 
 elif menu == "⚙️ Configurações":
     st.info("Sistema Conectado.")
