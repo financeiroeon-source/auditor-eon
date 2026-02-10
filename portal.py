@@ -1,20 +1,24 @@
 import streamlit as st
 import requests
 import json
+import hashlib
+import hmac
+import base64
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="CSI Huawei - Investigação", page_icon="🕵️", layout="wide")
+st.set_page_config(page_title="Portal Eon Solar", page_icon="☀️", layout="wide")
 
 # --- CONEXÃO GOOGLE SHEETS ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
 def conectar_gsheets():
     try:
         if "gcp_service_account" not in st.secrets: return None
         creds_dict = dict(st.secrets["gcp_service_account"])
-        SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(credentials)
         return client.open("Banco de Dados Eon").sheet1
@@ -28,9 +32,19 @@ def carregar_clientes():
         db = {}
         for row in rows:
             if "Nome_Conta" in row and row["Nome_Conta"]:
-                db[str(row["Nome_Conta"]).upper().strip()] = {"id": str(row["ID_Inversor"]), "marca": row["Marca"]}
+                db[str(row["Nome_Conta"]).upper().strip()] = {
+                    "id": str(row["ID_Inversor"]), "marca": row["Marca"], "nome": row["Nome_Inversor"]
+                }
         return db
     except: return {}
+
+def salvar_cliente(nome_conta, dados_usina):
+    try:
+        sheet = conectar_gsheets()
+        if not sheet: return False
+        sheet.append_row([nome_conta, str(dados_usina["id"]), dados_usina["marca"], dados_usina["nome"]])
+        return True
+    except: return False
 
 # --- CREDENCIAIS ---
 CREDS = {
@@ -38,80 +52,222 @@ CREDS = {
         "user": "Eon.solar",
         "pass": "eonsolar2024",
         "url": "https://la5.fusionsolar.huawei.com/thirdData"
+    },
+    "solis": {
+        "key_id": "1300386381676798170",
+        "key_secret": "70b315e18b914435abe726846e950eab",
+        "url": "https://www.soliscloud.com:13333"
     }
 }
 
-def get_token():
+# --- AUTH ---
+def get_huawei_token():
     try:
         r = requests.post(f"{CREDS['huawei']['url']}/login", json={"userName": CREDS['huawei']['user'], "systemCode": CREDS['huawei']['pass']}, timeout=10)
         if r.json().get("success"): return r.headers.get("xsrf-token")
     except: pass
     return None
 
-# --- INTERFACE ---
-st.title("🕵️ CSI: Investigação da Curva")
+def get_solis_auth(resource, body):
+    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    content_md5 = base64.b64encode(hashlib.md5(body.encode('utf-8')).digest()).decode('utf-8')
+    key = CREDS['solis']['key_secret'].encode('utf-8')
+    sign_str = f"POST\n{content_md5}\napplication/json\n{now}\n{resource}"
+    signature = hmac.new(key, sign_str.encode('utf-8'), hashlib.sha1).digest()
+    auth = f"API {CREDS['solis']['key_id']}:{base64.b64encode(signature).decode('utf-8')}"
+    return {"Authorization": auth, "Content-MD5": content_md5, "Content-Type": "application/json", "Date": now}
 
-db = carregar_clientes()
-col1, col2 = st.columns(2)
-nome_input = col1.text_input("Cliente:", "JOAO DA SILVA").upper().strip()
-data_alvo = col2.date_input("Dia do Erro (ex: 01/01):", datetime(2026, 1, 1))
-
-usina = db.get(nome_input)
-
-if usina:
-    st.info(f"Analisando: **{nome_input}** (ID: `{usina['id']}`)")
+# --- BUSCA SOLIS ---
+def buscar_geracao_solis(station_id, data_inicio, data_fim):
+    dados_diarios = {} 
+    meses = pd.date_range(data_inicio, data_fim, freq='MS').strftime("%Y-%m").tolist()
+    if data_inicio.strftime("%Y-%m") not in meses: meses.append(data_inicio.strftime("%Y-%m"))
     
-    if st.button("🔬 ABRIR PACOTE DE DADOS"):
-        token = get_token()
-        headers = {"xsrf-token": token}
-        
-        collect_time_day = int(datetime(data_alvo.year, data_alvo.month, data_alvo.day).timestamp() * 1000)
-        
-        st.write(f"Baixando curva do dia {data_alvo.strftime('%d/%m/%Y')}...")
-        
-        # 1. TENTA PEGAR A CURVA
+    for mes in set(meses):
         try:
-            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationDay", json={"stationCodes": usina['id'], "collectTime": collect_time_day}, headers=headers)
-            dados_curva = r.json().get("data", [])
-            
-            if dados_curva:
-                qtd = len(dados_curva)
-                st.success(f"📦 Encontrados {qtd} pacotes de dados neste dia!")
-                
-                # PEGA O PACOTE DO MEIO-DIA (Para garantir que tem sol e geração)
-                # Se pegar o primeiro (00:00) vai ser zero mesmo.
-                indice_meio_dia = int(qtd / 2) 
-                pacote_amostra = dados_curva[indice_meio_dia]
-                
-                hora_pacote = datetime.fromtimestamp(pacote_amostra["collectTime"]/1000).strftime('%H:%M:%S')
-                
-                st.divider()
-                st.markdown(f"### 🧬 Conteúdo do Pacote das {hora_pacote}")
-                st.markdown("Procure abaixo qualquer campo que tenha valor maior que 0:")
-                
-                # EXIBE O MAPA DE DADOS CRU
-                mapa = pacote_amostra.get("dataItemMap", {})
-                st.json(mapa)
-                
-                # DICA AUTOMÁTICA
-                candidatos = []
-                for k, v in mapa.items():
-                    try:
-                        if float(v) > 0:
-                            candidatos.append(f"{k} = {v}")
-                    except: pass
-                
-                if candidatos:
-                    st.success("💡 Campos com valor encontrados:")
-                    for c in candidatos:
-                        st.code(c)
-                else:
-                    st.warning("⚠️ Todos os campos neste pacote estão zerados ou nulos.")
-                    
-            else:
-                st.error("A API retornou lista vazia [] para a curva deste dia.")
-                
-        except Exception as e: st.error(str(e))
+            body = json.dumps({"stationId": station_id, "time": mes})
+            headers = get_solis_auth("/v1/api/stationDayEnergyList", body)
+            r = requests.post(f"{CREDS['solis']['url']}/v1/api/stationDayEnergyList", data=body, headers=headers)
+            records = r.json().get("data", {}).get("records", [])
+            for rec in records:
+                dia_str = rec.get("date", "")
+                if len(dia_str) < 3: full_date = f"{mes}-{int(dia_str):02d}"
+                else: full_date = dia_str
+                data_obj = datetime.strptime(full_date, "%Y-%m-%d").date()
+                if data_inicio <= data_obj <= data_fim:
+                    dados_diarios[data_obj] = float(rec.get("energy", 0))
+        except: pass
+        
+    if dados_diarios:
+        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
+        df['Data'] = pd.to_datetime(df['Data'])
+        df = df.set_index('Data').sort_index()
+        return df['kWh'].sum(), df
+    return 0.0, pd.DataFrame()
 
-else:
-    st.warning("Cliente não encontrado.")
+# --- BUSCA HUAWEI: O PESCADOR DE DATAS ---
+def buscar_geracao_huawei(station_code, data_inicio, data_fim):
+    token = get_huawei_token()
+    if not token: return 0.0, pd.DataFrame()
+    
+    headers = {"xsrf-token": token}
+    dados_diarios = {}
+    
+    # Lista de meses para varrer (inclui mês anterior para o drible do fuso horário)
+    ts_inicio = pd.Timestamp(data_inicio)
+    ts_fim = pd.Timestamp(data_fim)
+    
+    # Adiciona 1 mês antes e 1 mês depois na margem de segurança
+    dt_safe_start = ts_inicio - timedelta(days=32)
+    dt_safe_end = ts_fim + timedelta(days=32)
+    
+    meses = pd.date_range(dt_safe_start, dt_safe_end, freq='MS').tolist()
+    
+    st.toast(f"Varrendo tabelas de {len(meses)} meses...", icon="🗓️")
+    progresso = st.empty()
+    
+    # Cache local para não baixar o mesmo mês 2 vezes
+    meses_baixados = set()
+    
+    for mes_obj in meses:
+        # Pega sempre o dia 15 para garantir que a API entenda o mês correto
+        data_referencia = mes_obj.replace(day=15)
+        collect_time = int(datetime(data_referencia.year, data_referencia.month, 15).timestamp() * 1000)
+        
+        chave_mes = f"{data_referencia.year}-{data_referencia.month}"
+        if chave_mes in meses_baixados: continue
+        meses_baixados.add(chave_mes)
+        
+        progresso.text(f"Baixando tabela de {mes_obj.strftime('%B/%Y')}...")
+        
+        try:
+            # Pede a tabela do mês inteiro (Daily List)
+            payload = {"stationCodes": station_code, "collectTime": collect_time}
+            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=5)
+            dados = r.json().get("data", [])
+            
+            if isinstance(dados, list):
+                for item in dados:
+                    ms = item.get("collectTime", 0)
+                    if ms > 0:
+                        # Converte timestamp do item para data
+                        data_registro = datetime.fromtimestamp(ms / 1000).date()
+                        
+                        mapa = item.get("dataItemMap", {})
+                        # Campos que podem conter o valor diário
+                        val = float(mapa.get("inverter_power", 0) or 
+                                    mapa.get("product_power", 0) or 
+                                    mapa.get("daily_energy_yield", 0) or 
+                                    mapa.get("daily_yield", 0) or 
+                                    mapa.get("PVYield", 0) or 0)
+                        
+                        # Se achou valor válido, guarda na data correspondente
+                        # Como estamos varrendo meses extras, filtramos depois
+                        if val > 0 and val < 1000: # Filtro anti-acumulado gigante
+                            dados_diarios[data_registro] = val
+        except: pass
+
+    progresso.empty()
+
+    if dados_diarios:
+        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
+        df['Data'] = pd.to_datetime(df['Data'])
+        df = df.set_index('Data').sort_index()
+        
+        # Filtra para entregar apenas o período que o usuário pediu
+        mask = (df.index >= ts_inicio) & (df.index <= ts_fim)
+        df_final = df.loc[mask]
+        
+        return df_final['kWh'].sum(), df_final
+    
+    return 0.0, pd.DataFrame()
+
+# --- LISTAGEM ---
+@st.cache_data(ttl=600)
+def listar_todas_usinas():
+    lista = []
+    try:
+        token = get_huawei_token()
+        if token:
+            r = requests.post(f"{CREDS['huawei']['url']}/getStationList", json={"pageNo": 1, "pageSize": 100}, headers={"xsrf-token": token}, timeout=10)
+            d = r.json().get("data", [])
+            estacoes = d if isinstance(d, list) else d.get("list", [])
+            for s in estacoes:
+                lista.append({"id": str(s.get("stationCode")), "nome": s.get("stationName"), "marca": "Huawei", "display": f"Huawei | {s.get('stationName')}"})
+    except: pass
+    try:
+        body = json.dumps({"pageNo": 1, "pageSize": 100})
+        headers = get_solis_auth("/v1/api/userStationList", body)
+        r = requests.post(f"{CREDS['solis']['url']}/v1/api/userStationList", data=body, headers=headers, timeout=10)
+        d = r.json().get("data", {}).get("page", {}).get("records", [])
+        for s in d:
+            lista.append({"id": str(s.get("id")), "nome": s.get("stationName"), "marca": "Solis", "display": f"Solis | {s.get('stationName')}"})
+    except: pass
+    return lista
+
+# --- INTERFACE ---
+st.sidebar.title("☀️ Eon Solar")
+menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria de Conta", "⚙️ Configurações"])
+
+if menu == "🏠 Home":
+    st.title("Dashboard Geral")
+    with st.spinner("Conectando Banco..."):
+        db = carregar_clientes()
+    c1, c2 = st.columns(2)
+    c1.metric("Clientes", len(db))
+    c2.metric("Status", "Online 🟢")
+
+elif menu == "📄 Auditoria de Conta":
+    st.title("Nova Auditoria")
+    nome_input = st.text_input("Nome na Conta:", placeholder="JOAO DA SILVA").upper().strip()
+    
+    if nome_input:
+        db = carregar_clientes()
+        st.divider()
+        usina_vinculada = db.get(nome_input)
+        
+        if usina_vinculada:
+            st.success(f"✅ Cliente: **{usina_vinculada['nome']}**")
+        else:
+            st.warning(f"Cliente '{nome_input}' não encontrado.")
+            opcoes = listar_todas_usinas()
+            nomes = [u["display"] for u in opcoes]
+            escolha = st.selectbox("Vincular Inversor:", ["Selecione..."] + nomes)
+            if escolha != "Selecione..." and st.button("Salvar"):
+                obj = next(u for u in opcoes if u["display"] == escolha)
+                salvar_cliente(nome_input, obj)
+                st.rerun()
+
+        if usina_vinculada:
+            st.subheader("🗓️ Análise de Geração")
+            c1, c2 = st.columns(2)
+            dt_inicio = c1.date_input("Início", value=datetime.today().replace(day=1))
+            dt_fim = c2.date_input("Fim", value=datetime.today())
+            
+            if st.button("🚀 Auditar Geração"):
+                with st.spinner(f"Processando {usina_vinculada['marca']}..."):
+                    if usina_vinculada["marca"] == "Solis":
+                        total, df_diario = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
+                    elif usina_vinculada["marca"] == "Huawei":
+                        total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
+                    
+                    col_metrica, col_fatura = st.columns(2)
+                    col_metrica.metric("Geração Total", f"{total:.2f} kWh")
+                    
+                    fatura = col_fatura.number_input("Crédito Fatura (kWh)", value=0.0)
+                    
+                    if not df_diario.empty:
+                        st.bar_chart(df_diario, color="#FFA500")
+                        with st.expander("Ver Detalhes"):
+                            st.dataframe(df_diario.style.format("{:.2f} kWh"))
+                    
+                    if fatura > 0:
+                        diff = fatura - total
+                        st.divider()
+                        if diff < -5: st.error(f"⚠️ DIVERGÊNCIA: {diff:.2f} kWh")
+                        elif diff > 5: st.warning(f"⚠️ DIVERGÊNCIA POSITIVA: +{diff:.2f}")
+                        else: st.success("✅ CONTA BATIDA")
+
+elif menu == "⚙️ Configurações":
+    st.info("Sistema Conectado.")
+    if st.button("Recarregar"): st.cache_data.clear(); st.rerun()
