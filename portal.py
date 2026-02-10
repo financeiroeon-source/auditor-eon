@@ -109,7 +109,7 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
 
-# --- BUSCA HUAWEI: MODO INTEGRAL (CALCULADORA DE CURVA) ---
+# --- BUSCA HUAWEI: MODO INTEGRAL TURBINADO ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
@@ -117,60 +117,59 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     headers = {"xsrf-token": token}
     dados_diarios = {}
     
-    # Gera lista de dias para varrer um por um
-    dias_para_analisar = pd.date_range(data_inicio, data_fim)
+    # Tenta descobrir ID do dispositivo (caso precise usar Fallback)
+    dev_id_fallback = None
+    try:
+        r = requests.post(f"{CREDS['huawei']['url']}/getDevList", json={"stationCodes": station_code}, headers=headers, timeout=5)
+        devs = r.json().get("data", [])
+        if devs: dev_id_fallback = devs[0].get("id")
+    except: pass
     
+    dias_para_analisar = pd.date_range(data_inicio, data_fim)
     st.toast(f"Calculando curva de {len(dias_para_analisar)} dias...", icon="🧮")
     progresso = st.empty()
-    
-    # 1. TENTA PRIMEIRO VIA ESTAÇÃO (Mais Rápido)
-    # getKpiStationDay retorna a curva de potência do dia (active_power)
-    # Se integrarmos essa curva, temos o kWh.
-    
-    total_dias = len(dias_para_analisar)
     
     for i, dia_obj in enumerate(dias_para_analisar):
         progresso.text(f"Processando dia {dia_obj.strftime('%d/%m')}...")
         
         collect_time = int(datetime(dia_obj.year, dia_obj.month, dia_obj.day).timestamp() * 1000)
-        payload = {"stationCodes": station_code, "collectTime": collect_time}
         
+        soma_potencia = 0.0
+        pontos = 0
+        
+        # TENTATIVA 1: Curva da Estação (Mais comum)
         try:
-            # Pede a curva do dia
+            payload = {"stationCodes": station_code, "collectTime": collect_time}
             r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationDay", json=payload, headers=headers, timeout=5)
             dados = r.json().get("data", [])
             
-            soma_potencia = 0.0
-            pontos = 0
-            
-            if isinstance(dados, list):
+            if isinstance(dados, list) and len(dados) > 0:
                 for ponto in dados:
-                    mapa = ponto.get("dataItemMap", {})
-                    # active_power vem em kW ou W. Geralmente kW na API Northbound.
-                    potencia = float(mapa.get("active_power", 0) or 0)
+                    potencia = float(ponto.get("dataItemMap", {}).get("active_power", 0) or 0)
                     if potencia > 0:
                         soma_potencia += potencia
                         pontos += 1
-            
-            # CÁLCULO DA INTEGRAL (A Mágica)
-            # A Huawei geralmente entrega pontos a cada 5 minutos (12 pontos por hora)
-            # Energia (kWh) = Soma Potências (kW) * (5 minutos / 60 minutos)
-            # Simplificando: Soma / 12
-            
-            if pontos > 0:
-                kwh_dia = soma_potencia / 12  # Estimativa baseada em 5min sample
-                # Ajuste fino: Se a amostragem for diferente, o valor pode variar um pouco,
-                # mas é infinitamente melhor que 0.
-                
-                # Armazena
-                dados_diarios[dia_obj.date()] = round(kwh_dia, 2)
-            else:
-                # Se não veio nada na Estação, tenta no Device (Tipo 38)
-                # (Adicionei essa camada extra de segurança)
-                pass 
-                
-        except Exception as e:
-            print(f"Erro dia {dia_obj}: {e}")
+        except: pass
+        
+        # TENTATIVA 2: Se a estação falhou, tenta o Dispositivo (Smart Dongle Tipo 38)
+        if pontos == 0 and dev_id_fallback:
+            try:
+                payload = {"devIds": str(dev_id_fallback), "collectTime": collect_time}
+                r = requests.post(f"{CREDS['huawei']['url']}/getDevKpiDay", json=payload, headers=headers, timeout=5)
+                dados = r.json().get("data", [])
+                if isinstance(dados, list):
+                    for ponto in dados:
+                        potencia = float(ponto.get("dataItemMap", {}).get("active_power", 0) or 0)
+                        if potencia > 0:
+                            soma_potencia += potencia
+                            pontos += 1
+            except: pass
+
+        # CÁLCULO DA ENERGIA (Integral da Curva)
+        # Assumindo amostragem padrão de 5 min (12 pontos/hora)
+        if pontos > 0:
+            kwh_dia = soma_potencia / 12  
+            dados_diarios[dia_obj.date()] = round(kwh_dia, 2)
             
     progresso.empty()
 
@@ -180,84 +179,7 @@ def buscar_geracao_huawei(station_code, data_inicio, data_fim):
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
     
-    # Se falhar tudo, retorna 0
     return 0.0, pd.DataFrame()
 
 # --- FUNÇÃO LISTAGEM ---
-@st.cache_data(ttl=600)
-def listar_todas_usinas():
-    lista = []
-    # Huawei
-    try:
-        token = get_huawei_token()
-        if token:
-            r = requests.post(f"{CREDS['huawei']['url']}/getStationList", json={"pageNo": 1, "pageSize": 100}, headers={"xsrf-token": token}, timeout=10)
-            d = r.json().get("data", [])
-            estacoes = d if isinstance(d, list) else d.get("list", [])
-            for s in estacoes:
-                lista.append({"id": str(s.get("stationCode")), "nome": s.get("stationName"), "marca": "Huawei", "display": f"Huawei | {s.get('stationName')}"})
-    except: pass
-    # Solis
-    try:
-        body = json.dumps({"pageNo": 1, "pageSize": 100})
-        headers = get_solis_auth("/v1/api/userStationList", body)
-        r = requests.post(f"{CREDS['solis']['url']}/v1/api/userStationList", data=body, headers=headers, timeout=10)
-        d = r.json().get("data", {}).get("page", {}).get("records", [])
-        for s in d:
-            lista.append({"id": str(s.get("id")), "nome": s.get("stationName"), "marca": "Solis", "display": f"Solis | {s.get('stationName')}"})
-    except: pass
-    return lista
-
-# --- INTERFACE ---
-st.sidebar.title("☀️ Eon Solar")
-menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria de Conta", "⚙️ Configurações"])
-
-if menu == "🏠 Home":
-    st.title("Dashboard Geral")
-    with st.spinner("Sincronizando com Google Sheets..."):
-        db = carregar_clientes()
-    c1, c2 = st.columns(2)
-    c1.metric("Clientes Cadastrados", len(db))
-    c2.metric("Status", "Operacional 🟢")
-
-elif menu == "📄 Auditoria de Conta":
-    st.title("Nova Auditoria")
-    nome_input = st.text_input("Nome na Conta de Luz:", placeholder="Ex: JOAO DA SILVA").upper().strip()
-    
-    if nome_input:
-        db = carregar_clientes()
-        st.divider()
-        usina_vinculada = db.get(nome_input)
-        
-        if usina_vinculada:
-            st.success(f"✅ Cliente identificado: **{usina_vinculada['nome']}** ({usina_vinculada['marca']})")
-        else:
-            st.warning(f"Cliente '{nome_input}' não encontrado.")
-            opcoes = listar_todas_usinas()
-            nomes = [u["display"] for u in opcoes]
-            escolha = st.selectbox("Vincular a qual inversor?", ["Selecione..."] + nomes)
-            if escolha != "Selecione..." and st.button("💾 Salvar Vínculo"):
-                with st.spinner("Salvando..."):
-                    obj = next(u for u in opcoes if u["display"] == escolha)
-                    salvar_cliente(nome_input, obj)
-                    st.rerun()
-
-        if usina_vinculada:
-            st.subheader("🗓️ Análise de Geração")
-            c1, c2 = st.columns(2)
-            dt_inicio = c1.date_input("Início", value=datetime.today().replace(day=1))
-            dt_fim = c2.date_input("Fim", value=datetime.today())
-            
-            if st.button("🚀 Auditar Geração"):
-                with st.spinner(f"Reconstruindo curva de geração da {usina_vinculada['marca']}..."):
-                    total, df_diario = 0.0, pd.DataFrame()
-                    
-                    if usina_vinculada["marca"] == "Solis":
-                        total, df_diario = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
-                    elif usina_vinculada["marca"] == "Huawei":
-                        total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
-                    
-                    col_metrica, col_fatura = st.columns(2)
-                    col_metrica.metric("Geração Total (Inversor)", f"{total:.2f} kWh")
-                    
-                    fatura = col_fatura.number_input("Crédito na F
+@st.cache_data(ttl=
