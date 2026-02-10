@@ -3,3 +3,4 @@ google-generativeai>=0.8.6
 pypdf
 gspread
 google-auth
+pdfplumber
