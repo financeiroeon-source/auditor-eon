@@ -105,80 +105,75 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
 
-# --- BUSCA HUAWEI: O PESCADOR DE DATAS ---
+# --- BUSCA HUAWEI "REDE DE PESCA" (RÁPIDA E ABRANGENTE) ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
-    dados_diarios = {}
+    dados_filtrados = {}
     
-    # Lista de meses para varrer (inclui mês anterior para o drible do fuso horário)
+    # Define a margem de busca (Mês Anterior até Mês Seguinte)
+    # Isso garante que pegaremos o dado mesmo se a API errar o mês
     ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
     
-    # Adiciona 1 mês antes e 1 mês depois na margem de segurança
-    dt_safe_start = ts_inicio - timedelta(days=32)
-    dt_safe_end = ts_fim + timedelta(days=32)
+    dt_margem_inicio = ts_inicio - timedelta(days=32)
+    dt_margem_fim = ts_fim + timedelta(days=32)
     
-    meses = pd.date_range(dt_safe_start, dt_safe_end, freq='MS').tolist()
+    # Gera lista de meses únicos para consultar
+    meses_para_consultar = pd.date_range(dt_margem_inicio, dt_margem_fim, freq='MS').tolist()
     
-    st.toast(f"Varrendo tabelas de {len(meses)} meses...", icon="🗓️")
-    progresso = st.empty()
+    # Aviso discreto de carregamento
+    status = st.empty()
+    status.caption("🔄 Sincronizando dados...")
     
-    # Cache local para não baixar o mesmo mês 2 vezes
-    meses_baixados = set()
+    cache_meses = set()
     
-    for mes_obj in meses:
-        # Pega sempre o dia 15 para garantir que a API entenda o mês correto
-        data_referencia = mes_obj.replace(day=15)
-        collect_time = int(datetime(data_referencia.year, data_referencia.month, 15).timestamp() * 1000)
+    for mes_obj in meses_para_consultar:
+        # Usa dia 15 para evitar ambiguidade de borda de mês
+        collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000)
         
-        chave_mes = f"{data_referencia.year}-{data_referencia.month}"
-        if chave_mes in meses_baixados: continue
-        meses_baixados.add(chave_mes)
-        
-        progresso.text(f"Baixando tabela de {mes_obj.strftime('%B/%Y')}...")
+        chave = f"{mes_obj.year}-{mes_obj.month}"
+        if chave in cache_meses: continue
+        cache_meses.add(chave)
         
         try:
-            # Pede a tabela do mês inteiro (Daily List)
+            # Pede o mês inteiro (RÁPIDO - 1 call por mês)
             payload = {"stationCodes": station_code, "collectTime": collect_time}
             r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=5)
-            dados = r.json().get("data", [])
+            lista_dias = r.json().get("data", [])
             
-            if isinstance(dados, list):
-                for item in dados:
+            if isinstance(lista_dias, list):
+                for item in lista_dias:
+                    # AQUI ESTÁ O TRUQUE: Confia na data que vem DENTRO do pacote, não na que pedimos
                     ms = item.get("collectTime", 0)
                     if ms > 0:
-                        # Converte timestamp do item para data
-                        data_registro = datetime.fromtimestamp(ms / 1000).date()
+                        data_real = datetime.fromtimestamp(ms / 1000).date()
                         
-                        mapa = item.get("dataItemMap", {})
-                        # Campos que podem conter o valor diário
-                        val = float(mapa.get("inverter_power", 0) or 
-                                    mapa.get("product_power", 0) or 
-                                    mapa.get("daily_energy_yield", 0) or 
-                                    mapa.get("daily_yield", 0) or 
-                                    mapa.get("PVYield", 0) or 0)
-                        
-                        # Se achou valor válido, guarda na data correspondente
-                        # Como estamos varrendo meses extras, filtramos depois
-                        if val > 0 and val < 1000: # Filtro anti-acumulado gigante
-                            dados_diarios[data_registro] = val
+                        # Verifica se essa data interessa ao usuário
+                        if data_inicio <= data_real <= data_fim:
+                            mapa = item.get("dataItemMap", {})
+                            # Pega qualquer campo que tenha energia
+                            # 'inverter_power' foi o que funcionou no seu PDF (trazia ~60-80 kWh)
+                            val = float(mapa.get("inverter_power", 0) or 
+                                      mapa.get("inverterYield", 0) or 
+                                      mapa.get("product_power", 0) or 
+                                      mapa.get("daily_energy_yield", 0) or 0)
+                            
+                            # Filtro de segurança: ignora valores absurdos (> 1000 kWh/dia para residencial)
+                            # para não pegar aquele "acumulado total" que às vezes aparece bugado
+                            if val > 0 and val < 1000:
+                                dados_filtrados[data_real] = val
         except: pass
 
-    progresso.empty()
+    status.empty()
 
-    if dados_diarios:
-        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
+    if dados_filtrados:
+        df = pd.DataFrame(list(dados_filtrados.items()), columns=['Data', 'kWh'])
         df['Data'] = pd.to_datetime(df['Data'])
         df = df.set_index('Data').sort_index()
-        
-        # Filtra para entregar apenas o período que o usuário pediu
-        mask = (df.index >= ts_inicio) & (df.index <= ts_fim)
-        df_final = df.loc[mask]
-        
-        return df_final['kWh'].sum(), df_final
+        return df['kWh'].sum(), df
     
     return 0.0, pd.DataFrame()
 
@@ -211,7 +206,7 @@ menu = st.sidebar.radio("Navegação", ["🏠 Home", "📄 Auditoria de Conta", 
 
 if menu == "🏠 Home":
     st.title("Dashboard Geral")
-    with st.spinner("Conectando Banco..."):
+    with st.spinner("Conectando..."):
         db = carregar_clientes()
     c1, c2 = st.columns(2)
     c1.metric("Clientes", len(db))
@@ -253,13 +248,14 @@ elif menu == "📄 Auditoria de Conta":
                     
                     col_metrica, col_fatura = st.columns(2)
                     col_metrica.metric("Geração Total", f"{total:.2f} kWh")
-                    
                     fatura = col_fatura.number_input("Crédito Fatura (kWh)", value=0.0)
                     
+                    # Se tiver dados, mostra gráfico simples só pra confirmar visualmente
                     if not df_diario.empty:
-                        st.bar_chart(df_diario, color="#FFA500")
-                        with st.expander("Ver Detalhes"):
-                            st.dataframe(df_diario.style.format("{:.2f} kWh"))
+                        # Formatação para garantir barras separadas
+                        chart_data = df_diario.copy()
+                        chart_data.index = chart_data.index.strftime("%d/%m")
+                        st.bar_chart(chart_data, color="#FFA500", height=200)
                     
                     if fatura > 0:
                         diff = fatura - total
