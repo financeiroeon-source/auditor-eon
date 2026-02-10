@@ -4,53 +4,39 @@ import json
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Microscópio Huawei v2.1", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="Microscópio v3.0 (Corrigido)", page_icon="🔬", layout="wide")
 
-# --- CONEXÃO GOOGLE SHEETS (CORRIGIDA) ---
+# --- CONEXÃO GOOGLE SHEETS ---
 def conectar_gsheets():
     try:
-        # Verifica se o segredo existe
         if "gcp_service_account" not in st.secrets:
-            st.error("❌ Erro: Segredo 'gcp_service_account' não encontrado no Secrets.")
+            st.error("❌ Erro: Segredo 'gcp_service_account' ausente.")
             return None
-            
         creds_dict = dict(st.secrets["gcp_service_account"])
-        
-        # AQUI ESTAVA O PROBLEMA: ADICIONAMOS O ESCOPO "DRIVE"
-        SCOPES = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        
+        SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(credentials)
-        sheet = client.open("Banco de Dados Eon").sheet1
-        return sheet
+        return client.open("Banco de Dados Eon").sheet1
     except Exception as e:
-        st.error(f"❌ Erro ao conectar na Planilha: {e}")
+        st.error(f"❌ Erro Planilha: {e}")
         return None
 
 def carregar_clientes():
     sheet = conectar_gsheets()
     if not sheet: return {}
-    
     try:
         rows = sheet.get_all_records()
         db = {}
         for row in rows:
             if "Nome_Conta" in row and row["Nome_Conta"]:
-                # Normaliza para maiúsculas e remove espaços extras
-                chave = str(row["Nome_Conta"]).upper().strip()
-                db[chave] = {"id": str(row["ID_Inversor"]), "marca": row["Marca"]}
+                db[str(row["Nome_Conta"]).upper().strip()] = {"id": str(row["ID_Inversor"]), "marca": row["Marca"]}
         return db
-    except Exception as e:
-        st.error(f"❌ Erro ao ler linhas: {e}")
-        return {}
+    except: return {}
 
-# --- CREDENCIAIS HUAWEI ---
+# --- CREDENCIAIS ---
 CREDS = {
     "huawei": {
         "user": "Eon.solar",
@@ -67,80 +53,89 @@ def get_token():
     return None
 
 # --- INTERFACE ---
-st.title("🔬 Microscópio de Dados v2.1")
+st.title("🔬 Microscópio v3.0 (Busca Precisa)")
 
-# 1. DIAGNÓSTICO DA PLANILHA
-st.markdown("### 1. Status do Banco de Dados")
 db = carregar_clientes()
+if not db: st.stop()
 
-if len(db) > 0:
-    st.success(f"✅ Banco conectado! {len(db)} clientes carregados.")
-    st.caption(f"Exemplos na lista: {', '.join(list(db.keys())[:3])}...")
-else:
-    st.error("⚠️ O Banco de Dados está vazio ou não conectou.")
-    st.stop() 
+col1, col2 = st.columns(2)
+nome_input = col1.text_input("Cliente:", "JOAO DA SILVA").upper().strip()
+data_alvo = col2.date_input("Data Exata:", datetime(2026, 1, 1))
 
-st.divider()
-
-# 2. SELEÇÃO DO CLIENTE
-col_nome, col_data = st.columns(2)
-nome_input = col_nome.text_input("Nome do Cliente:", "JOAO DA SILVA").upper().strip()
-data_alvo = col_data.date_input("Data para Investigar:", datetime.today())
-
-# Verifica se o cliente existe
 usina = db.get(nome_input)
 
 if usina:
-    st.info(f"🎯 Cliente Encontrado: **{nome_input}** | ID Usina: `{usina['id']}`")
+    st.success(f"Alvo: **{nome_input}** (ID: `{usina['id']}`)")
     
-    if st.button("🔎 EXAMINAR DADOS BRUTOS (CLIQUE AQUI)"):
-        
-        st.write("--- INICIANDO VARREDURA ---")
+    if st.button("🔎 BUSCAR DADO EXATO"):
         token = get_token()
-        if not token:
-            st.error("❌ Falha de Login na Huawei API.")
-            st.stop()
-            
+        if not token: st.error("Erro Login Huawei"); st.stop()
         headers = {"xsrf-token": token}
-        collect_time = int(datetime(data_alvo.year, data_alvo.month, data_alvo.day).timestamp() * 1000)
         
-        # A) LISTA DISPOSITIVOS
-        st.markdown("#### A) Dispositivos na Usina")
-        ids_dispositivos = []
+        # TRUQUE: Pede o dia 15 do mês para garantir que venha o mês certo
+        # Se pedirmos dia 1, as vezes vem o mês anterior.
+        data_segura = data_alvo.replace(day=15)
+        collect_time = int(datetime(data_segura.year, data_segura.month, data_segura.day).timestamp() * 1000)
+        
+        st.write(f"⏳ Consultando tabela mensal de {data_alvo.strftime('%B/%Y')}...")
+        
         try:
-            r = requests.post(f"{CREDS['huawei']['url']}/getDevList", json={"stationCodes": usina['id']}, headers=headers)
-            devs = r.json().get("data", [])
-            st.json(devs)
-            ids_dispositivos = [d.get("id") for d in devs]
-        except Exception as e: st.error(f"Erro DevList: {e}")
-
-        # B) DADOS DA ESTAÇÃO
-        st.markdown(f"#### B) Dados da Estação (Dia {data_alvo.strftime('%d/%m')})")
-        try:
+            # Usa getKpiStationMonth que provou ser o que retorna a lista diária
             payload = {"stationCodes": usina['id'], "collectTime": collect_time}
-            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationDay", json=payload, headers=headers)
-            st.json(r.json())
-        except Exception as e: st.error(f"Erro StationDay: {e}")
-
-        # C) DADOS DOS DISPOSITIVOS
-        st.markdown("#### C) Dados dos Dispositivos (Tentativa de achar Curva)")
-        if not ids_dispositivos:
-            st.warning("Nenhum dispositivo encontrado para varrer.")
-        
-        for dev_id in ids_dispositivos:
-            with st.expander(f"Dispositivo ID: {dev_id}"):
-                try:
-                    payload = {"devIds": str(dev_id), "collectTime": collect_time}
-                    r = requests.post(f"{CREDS['huawei']['url']}/getDevKpiDay", json=payload, headers=headers)
-                    dados = r.json().get("data", [])
-                    if dados:
-                        st.success("TEM DADOS! 👇")
-                        st.json(dados[:5]) # Mostra os 5 primeiros pontos
-                    else:
-                        st.warning("Lista vazia [] (Sem curva neste dia)")
-                except Exception as e: st.error(str(e))
+            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers)
+            dados = r.json().get("data", [])
+            
+            # PROCURA O DIA EXATO NA LISTA
+            encontrado = None
+            lista_tabela = []
+            
+            for item in dados:
+                ms = item.get("collectTime", 0)
+                data_item = datetime.fromtimestamp(ms / 1000).date()
+                
+                # Extrai valores candidatos
+                mapa = item.get("dataItemMap", {})
+                val_inv = mapa.get("inverter_power", 0)
+                val_prod = mapa.get("product_power", 0)
+                val_yield = mapa.get("daily_energy_yield", 0)
+                
+                # Guarda na tabela visual
+                lista_tabela.append({
+                    "Data": data_item.strftime("%d/%m/%Y"),
+                    "inverter_power (kWh?)": val_inv,
+                    "product_power": val_prod,
+                    "daily_yield": val_yield
+                })
+                
+                if data_item == data_alvo:
+                    encontrado = item
+            
+            # MOSTRA RESULTADO
+            if encontrado:
+                mapa = encontrado.get("dataItemMap", {})
+                val_final = mapa.get("inverter_power", 0) # Apostando nesse campo baseado no PDF
+                
+                st.divider()
+                st.markdown(f"### 🎉 ENCONTRADO!")
+                st.markdown(f"Data: **{data_alvo.strftime('%d/%m/%Y')}**")
+                
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("inverter_power", f"{mapa.get('inverter_power')} kWh")
+                col_b.metric("inverterYield", f"{mapa.get('inverterYield')} kWh")
+                col_c.metric("PVYield", f"{mapa.get('PVYield')} kWh")
+                
+                if abs(float(val_final) - 62.20) < 1:
+                    st.success("✅ **BINGO!** O valor bate com o esperado (62.20)!")
+                    st.caption(f"Campo correto identificado: 'inverter_power' ou 'inverterYield'.")
+                else:
+                    st.warning(f"⚠️ Valor encontrado ({val_final}) é diferente de 62.20.")
+            else:
+                st.error(f"❌ Dia {data_alvo} não encontrado na lista retornada pela API.")
+                st.write("Lista recebida (confira as datas):")
+                st.dataframe(lista_tabela)
+                
+        except Exception as e:
+            st.error(f"Erro API: {e}")
 
 else:
-    st.warning(f"❌ Cliente '{nome_input}' não encontrado na lista carregada.")
-    with st.expander("Ver lista de nomes disponíveis no sistema"):
-        st.write(list(db.keys()))
+    st.warning("Cliente não encontrado.")
