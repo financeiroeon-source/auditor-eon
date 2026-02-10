@@ -10,7 +10,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Portal Eon Solar", page_icon="☀️", layout="wide")
+st.set_page_config(page_title="Portal Eon Solar", page_icon="⚡", layout="wide")
 
 # --- CONEXÃO GOOGLE SHEETS ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -105,72 +105,83 @@ def buscar_geracao_solis(station_id, data_inicio, data_fim):
         return df['kWh'].sum(), df
     return 0.0, pd.DataFrame()
 
-# --- BUSCA HUAWEI "REDE DE PESCA" (RÁPIDA E ABRANGENTE) ---
+# --- BUSCA HUAWEI "TRATOR" (Focado no Total) ---
 def buscar_geracao_huawei(station_code, data_inicio, data_fim):
     token = get_huawei_token()
     if not token: return 0.0, pd.DataFrame()
     
     headers = {"xsrf-token": token}
-    dados_filtrados = {}
+    total_final = 0.0
     
-    # Define a margem de busca (Mês Anterior até Mês Seguinte)
-    # Isso garante que pegaremos o dado mesmo se a API errar o mês
+    # Datas para consulta
     ts_inicio = pd.Timestamp(data_inicio)
     ts_fim = pd.Timestamp(data_fim)
     
+    # 1. TENTATIVA ANUAL (Mais limpa)
+    # Baixa o ano inteiro e procura o mês específico
+    try:
+        st.toast(f"Consultando fechamento anual...", icon="📅")
+        collect_time_year = int(datetime(ts_inicio.year, 1, 1).timestamp() * 1000)
+        r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationYear", json={"stationCodes": station_code, "collectTime": collect_time_year}, headers=headers, timeout=5)
+        meses_ano = r.json().get("data", [])
+        
+        for m in meses_ano:
+            ms = m.get("collectTime", 0)
+            if ms > 0:
+                data_mes = datetime.fromtimestamp(ms / 1000).date()
+                # Se o mês do registro for o mesmo do mês pedido (ex: Janeiro)
+                if data_mes.year == ts_inicio.year and data_mes.month == ts_inicio.month:
+                    mapa = m.get("dataItemMap", {})
+                    val = float(mapa.get("inverter_power", 0) or mapa.get("product_power", 0) or 0)
+                    if val > 0:
+                        return val, pd.DataFrame() # Retorna direto se achou!
+    except: pass
+    
+    # 2. TENTATIVA MENSAL (Se anual falhou, varre dias)
+    # Baixa Mês Anterior + Atual + Seguinte para garantir que pegamos tudo
+    st.toast(f"Varrendo registros diários...", icon="🔍")
+    
     dt_margem_inicio = ts_inicio - timedelta(days=32)
     dt_margem_fim = ts_fim + timedelta(days=32)
-    
-    # Gera lista de meses únicos para consultar
     meses_para_consultar = pd.date_range(dt_margem_inicio, dt_margem_fim, freq='MS').tolist()
     
-    # Aviso discreto de carregamento
-    status = st.empty()
-    status.caption("🔄 Sincronizando dados...")
-    
+    dados_diarios = {}
     cache_meses = set()
     
     for mes_obj in meses_para_consultar:
-        # Usa dia 15 para evitar ambiguidade de borda de mês
-        collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000)
-        
+        collect_time = int(datetime(mes_obj.year, mes_obj.month, 15).timestamp() * 1000) # Dia 15 para segurança
         chave = f"{mes_obj.year}-{mes_obj.month}"
         if chave in cache_meses: continue
         cache_meses.add(chave)
         
         try:
-            # Pede o mês inteiro (RÁPIDO - 1 call por mês)
-            payload = {"stationCodes": station_code, "collectTime": collect_time}
-            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json=payload, headers=headers, timeout=5)
+            r = requests.post(f"{CREDS['huawei']['url']}/getKpiStationMonth", json={"stationCodes": station_code, "collectTime": collect_time}, headers=headers, timeout=5)
             lista_dias = r.json().get("data", [])
             
             if isinstance(lista_dias, list):
                 for item in lista_dias:
-                    # AQUI ESTÁ O TRUQUE: Confia na data que vem DENTRO do pacote, não na que pedimos
                     ms = item.get("collectTime", 0)
                     if ms > 0:
                         data_real = datetime.fromtimestamp(ms / 1000).date()
+                        mapa = item.get("dataItemMap", {})
                         
-                        # Verifica se essa data interessa ao usuário
-                        if data_inicio <= data_real <= data_fim:
-                            mapa = item.get("dataItemMap", {})
-                            # Pega qualquer campo que tenha energia
-                            # 'inverter_power' foi o que funcionou no seu PDF (trazia ~60-80 kWh)
-                            val = float(mapa.get("inverter_power", 0) or 
-                                      mapa.get("inverterYield", 0) or 
-                                      mapa.get("product_power", 0) or 
-                                      mapa.get("daily_energy_yield", 0) or 0)
-                            
-                            # Filtro de segurança: ignora valores absurdos (> 1000 kWh/dia para residencial)
-                            # para não pegar aquele "acumulado total" que às vezes aparece bugado
-                            if val > 0 and val < 1000:
-                                dados_filtrados[data_real] = val
+                        # Pega valor de energia
+                        val = float(mapa.get("inverter_power", 0) or mapa.get("inverterYield", 0) or mapa.get("product_power", 0) or 0)
+                        
+                        # ESTRATÉGIA "O DIA GIGANTE"
+                        # Se acharmos um valor > 500 kWh num dia só, isso é o TOTAL DO MÊS bugado. Usamos ele.
+                        if val > 500 and (data_inicio <= data_real <= data_fim):
+                            st.toast(f"Encontrado registro consolidado no dia {data_real.strftime('%d/%m')}", icon="📦")
+                            return val, pd.DataFrame() # Retorna o valor gigante como total
+                        
+                        # Se for valor normal, guarda para somar
+                        if val > 0 and (data_inicio <= data_real <= data_fim):
+                            dados_diarios[data_real] = val
         except: pass
 
-    status.empty()
-
-    if dados_filtrados:
-        df = pd.DataFrame(list(dados_filtrados.items()), columns=['Data', 'kWh'])
+    # 3. SOMA MANUAL (Se não achou gigante)
+    if dados_diarios:
+        df = pd.DataFrame(list(dados_diarios.items()), columns=['Data', 'kWh'])
         df['Data'] = pd.to_datetime(df['Data'])
         df = df.set_index('Data').sort_index()
         return df['kWh'].sum(), df
@@ -240,29 +251,23 @@ elif menu == "📄 Auditoria de Conta":
             dt_fim = c2.date_input("Fim", value=datetime.today())
             
             if st.button("🚀 Auditar Geração"):
-                with st.spinner(f"Processando {usina_vinculada['marca']}..."):
+                with st.spinner(f"Obtendo total da {usina_vinculada['marca']}..."):
                     if usina_vinculada["marca"] == "Solis":
                         total, df_diario = buscar_geracao_solis(usina_vinculada["id"], dt_inicio, dt_fim)
                     elif usina_vinculada["marca"] == "Huawei":
                         total, df_diario = buscar_geracao_huawei(usina_vinculada["id"], dt_inicio, dt_fim)
                     
-                    col_metrica, col_fatura = st.columns(2)
-                    col_metrica.metric("Geração Total", f"{total:.2f} kWh")
-                    fatura = col_fatura.number_input("Crédito Fatura (kWh)", value=0.0)
+                    # RESULTADO PRINCIPAL (GRANDE)
+                    st.metric("Geração Total no Período", f"{total:.2f} kWh")
                     
-                    # Se tiver dados, mostra gráfico simples só pra confirmar visualmente
-                    if not df_diario.empty:
-                        # Formatação para garantir barras separadas
-                        chart_data = df_diario.copy()
-                        chart_data.index = chart_data.index.strftime("%d/%m")
-                        st.bar_chart(chart_data, color="#FFA500", height=200)
+                    fatura = st.number_input("Crédito na Fatura (kWh)", value=0.0)
                     
                     if fatura > 0:
                         diff = fatura - total
                         st.divider()
-                        if diff < -5: st.error(f"⚠️ DIVERGÊNCIA: {diff:.2f} kWh")
-                        elif diff > 5: st.warning(f"⚠️ DIVERGÊNCIA POSITIVA: +{diff:.2f}")
-                        else: st.success("✅ CONTA BATIDA")
+                        if diff < -5: st.error(f"⚠️ DIVERGÊNCIA: {diff:.2f} kWh (Faltou crédito)")
+                        elif diff > 5: st.warning(f"⚠️ DIVERGÊNCIA: +{diff:.2f} kWh (Sobrou crédito)")
+                        else: st.success(f"✅ CONTA BATIDA (Diferença: {diff:.2f} kWh)")
 
 elif menu == "⚙️ Configurações":
     st.info("Sistema Conectado.")
