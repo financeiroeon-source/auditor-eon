@@ -7,9 +7,9 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Microscópio Huawei v2", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="Microscópio Huawei v2.1", page_icon="🔬", layout="wide")
 
-# --- CONEXÃO GOOGLE SHEETS COM DEBUG ---
+# --- CONEXÃO GOOGLE SHEETS (CORRIGIDA) ---
 def conectar_gsheets():
     try:
         # Verifica se o segredo existe
@@ -18,7 +18,14 @@ def conectar_gsheets():
             return None
             
         creds_dict = dict(st.secrets["gcp_service_account"])
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        
+        # AQUI ESTAVA O PROBLEMA: ADICIONAMOS O ESCOPO "DRIVE"
+        SCOPES = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(credentials)
         sheet = client.open("Banco de Dados Eon").sheet1
         return sheet
@@ -60,7 +67,7 @@ def get_token():
     return None
 
 # --- INTERFACE ---
-st.title("🔬 Microscópio de Dados v2")
+st.title("🔬 Microscópio de Dados v2.1")
 
 # 1. DIAGNÓSTICO DA PLANILHA
 st.markdown("### 1. Status do Banco de Dados")
@@ -68,11 +75,10 @@ db = carregar_clientes()
 
 if len(db) > 0:
     st.success(f"✅ Banco conectado! {len(db)} clientes carregados.")
-    # Mostra os 3 primeiros nomes para conferência
     st.caption(f"Exemplos na lista: {', '.join(list(db.keys())[:3])}...")
 else:
     st.error("⚠️ O Banco de Dados está vazio ou não conectou.")
-    st.stop() # Para tudo se não tiver banco
+    st.stop() 
 
 st.divider()
 
@@ -87,7 +93,6 @@ usina = db.get(nome_input)
 if usina:
     st.info(f"🎯 Cliente Encontrado: **{nome_input}** | ID Usina: `{usina['id']}`")
     
-    # O BOTÃO AGORA APARECE SEMPRE QUE O CLIENTE EXISTIR
     if st.button("🔎 EXAMINAR DADOS BRUTOS (CLIQUE AQUI)"):
         
         st.write("--- INICIANDO VARREDURA ---")
@@ -136,7 +141,6 @@ if usina:
                 except Exception as e: st.error(str(e))
 
 else:
-    # SE NÃO ACHOU O NOME, ELE AVISA E MOSTRA A LISTA PARA VOCÊ COPIAR
     st.warning(f"❌ Cliente '{nome_input}' não encontrado na lista carregada.")
     with st.expander("Ver lista de nomes disponíveis no sistema"):
         st.write(list(db.keys()))
